@@ -47,11 +47,29 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
     try {
       const response = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_API_KEY}`,
-        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }) }
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseModalities: ['IMAGE'] }
+          })
+        }
       );
       const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data?.error?.message || `Gemini request failed (${response.status}).`);
+      }
+      const finishReason = data?.candidates?.[0]?.finishReason;
       const imagePart = data?.candidates?.[0]?.content?.parts?.find((p) => p.inlineData);
-      if (!imagePart) throw new Error('Model did not return image data.');
+      if (!imagePart) {
+        // finishReason SAFETY/PROHIBITED_CONTENT means Gemini refused the
+        // prompt itself, not a bug - surface that distinctly from other failures.
+        if (finishReason && finishReason !== 'STOP') {
+          throw new Error(`Gemini declined to generate this image (${finishReason}). Try rephrasing the prompt.`);
+        }
+        throw new Error('Model did not return image data.');
+      }
       const fileId = uuid();
       const filePath = path.join(UPLOAD_DIR, `${fileId}.png`);
       fs.writeFileSync(filePath, Buffer.from(imagePart.inlineData.data, 'base64'));
