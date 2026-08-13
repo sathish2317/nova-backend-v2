@@ -17,6 +17,7 @@ app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // optional - only /generate-image needs this
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
 if (!GROQ_API_KEY) {
@@ -24,8 +25,17 @@ if (!GROQ_API_KEY) {
   process.exit(1);
 }
 
+if (!GEMINI_API_KEY) {
+  console.warn('WARNING: GEMINI_API_KEY is missing. /generate-image will return a "not configured" error until you add it.');
+}
+
 app.use(cors());
 app.use(express.json());
+
+// Serves uploaded files AND generated images back to the app, e.g.
+// GET /files/<uuid>.png - without this, /generate-image "succeeds" on the
+// server but the app has nothing to actually load.
+app.use('/files', express.static(path.join(__dirname, 'uploads')));
 
 // Log every incoming request - helpful for confirming the app is actually
 // reaching this server while you're testing. Shows up in Render's Logs tab.
@@ -327,6 +337,11 @@ app.get('/news', async (req, res) => {
     res.status(500).json({ error: 'Something went wrong getting the news.' });
   }
 });
+
+// Registers /upload, /generate-image, /generate-video, /codelab/* on top
+// of this app. This line was missing before - the routes were defined in
+// server-additions.js but never actually attached to `app`.
+registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY });
 
 app.listen(PORT, () => {
   console.log(`Nova backend listening on port ${PORT}`);
