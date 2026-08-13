@@ -8,6 +8,8 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
+const path = require('path');
+const registerNovaLabRoutes = require('./server-additions');
 
 // Render sits behind a reverse proxy - this tells Express to trust the
 // X-Forwarded-For header so express-rate-limit can identify users correctly.
