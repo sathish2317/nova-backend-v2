@@ -17,7 +17,7 @@ app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GEMINI_API_KEY = AQ.Ab8RN6LwY0gYdcIbSFStJ6nxNMNBKnYlGjX3fa4FMpWn9sqfhg; // optional - only /generate-image needs this
+const GEMINI_API_KEY =process.env.GEMINI_API_KEY; // optional - only /generate-image needs this
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
 if (!GROQ_API_KEY) {
