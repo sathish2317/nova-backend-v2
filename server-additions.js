@@ -40,22 +40,92 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
 
 app.post('/generate-image', async (req, res) => {
   const { prompt } = req.body;
-  if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
-  if (!GEMINI_API_KEY) {
-    return res.status(501).json({ error: 'Image generation needs GEMINI_API_KEY - Groq has no image-generation model, so this route still relies on Gemini.' });
-  }
-  try {
-    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${GEMINI_API_KEY}` // Use the GEMINI_API_KEY as a header
-      },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { responseModalities: ['IMAGE'] }
-      })
+
+  if (!prompt) {
+    return res.status(400).json({
+      error: 'prompt is required.'
     });
+  }
+
+  if (!GEMINI_API_KEY) {
+    return res.status(501).json({
+      error: 'Image generation needs GEMINI_API_KEY.'
+    });
+  }
+
+  try {
+    const response = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': GEMINI_API_KEY
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: prompt
+                }
+              ]
+            }
+          ],
+          generationConfig: {
+            responseModalities: ['IMAGE']
+          }
+        })
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        data?.error?.message ||
+        `Gemini request failed (${response.status})`
+      );
+    }
+
+    const parts =
+      data?.candidates?.[0]?.content?.parts || [];
+
+    const imagePart = parts.find(
+      part => part.inlineData?.data
+    );
+
+    if (!imagePart) {
+      throw new Error('No image data returned by Gemini.');
+    }
+
+    const fileId = uuid();
+    const filePath = path.join(
+      UPLOAD_DIR,
+      `${fileId}.png`
+    );
+
+    fs.writeFileSync(
+      filePath,
+      Buffer.from(
+        imagePart.inlineData.data,
+        'base64'
+      )
+    );
+
+    res.json({
+      imageUrl: `/files/${fileId}.png`,
+      caption: "Here's what I generated."
+    });
+
+  } catch (err) {
+    console.error('Image generation error:', err);
+
+    res.status(500).json({
+      error: `Image generation failed: ${err.message}`
+    });
+  }
+});
 
   app.post('/generate-video', async (req, res) => {
     const { prompt } = req.body;
