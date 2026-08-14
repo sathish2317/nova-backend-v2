@@ -47,55 +47,17 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
     res.json({ fileId, url: `/files/${path.basename(finalPath)}`, name: req.file.originalname });
   });
 
-app.post('/generate-image', async (req, res) => {
-  const { prompt } = req.body;
-
-  if (!prompt) {
-    return res.status(400).json({
-      error: 'prompt is required.'
-    });
-  }
-
-  if (!GEMINI_API_KEY) {
-    return res.status(501).json({
-      error: 'Image generation needs GEMINI_API_KEY.'
-    });
-  }
-
-  try {
-    const response = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': GEMINI_API_KEY
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  text: prompt
-                }
-              ]
-            }
-          ],
-          generationConfig: {
-            responseModalities: ['IMAGE']
-          }
-        })
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(
-        data?.error?.message ||
-        `Gemini request failed (${response.status})`
+  app.post('/generate-image', async (req, res) => {
+    const { prompt } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
+    if (!GEMINI_API_KEY) {
+      return res.status(501).json({ error: 'Image generation needs GEMINI_API_KEY - Groq has no image-generation model, so this route still relies on Gemini.' });
+    }
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_API_KEY}`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }) }
       );
-<<<<<<< HEAD
       if (!response.ok) {
         const errText = await response.text();
         throw new Error(`Gemini responded ${response.status}: ${errText.slice(0, 200)}`);
@@ -109,48 +71,8 @@ app.post('/generate-image', async (req, res) => {
       res.json({ imageUrl: `/files/${fileId}.png`, caption: 'Here\'s what I generated.' });
     } catch (err) {
       res.status(500).json({ error: `Image generation failed: ${err.message}` });
-=======
->>>>>>> 79a6644e906357c5fcff1f15270a20f97a6d42f1
     }
-
-    const parts =
-      data?.candidates?.[0]?.content?.parts || [];
-
-    const imagePart = parts.find(
-      part => part.inlineData?.data
-    );
-
-    if (!imagePart) {
-      throw new Error('No image data returned by Gemini.');
-    }
-
-    const fileId = uuid();
-    const filePath = path.join(
-      UPLOAD_DIR,
-      `${fileId}.png`
-    );
-
-    fs.writeFileSync(
-      filePath,
-      Buffer.from(
-        imagePart.inlineData.data,
-        'base64'
-      )
-    );
-
-    res.json({
-      imageUrl: `/files/${fileId}.png`,
-      caption: "Here's what I generated."
-    });
-
-  } catch (err) {
-    console.error('Image generation error:', err);
-
-    res.status(500).json({
-      error: `Image generation failed: ${err.message}`
-    });
-  }
-});
+  });
 
   app.post('/generate-video', async (req, res) => {
     const { prompt } = req.body;
