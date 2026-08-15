@@ -17,16 +17,11 @@ app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GEMINI_API_KEY =process.env.GEMINI_API_KEY; // optional - only /generate-image needs this
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
 if (!GROQ_API_KEY) {
   console.error('ERROR: GROQ_API_KEY is missing. Add it in your .env file (local) or Render environment variables (deployed).');
   process.exit(1);
-}
-
-if (!GEMINI_API_KEY) {
-  console.warn('WARNING: GEMINI_API_KEY is missing. /generate-image will return a "not configured" error until you add it.');
 }
 
 app.use(cors());
@@ -53,26 +48,32 @@ const chatLimiter = rateLimit({
 });
 
 // Nova's personality lives here. Edit anytime, or let the app pick one of these.
+// Language rule is shared and appended to every personality below: Tamil by
+// default, English only when the user's own message is in English.
+const LANGUAGE_RULE = `Language rule: reply in Tamil (Tamil script) by default. If, and only if, the user's most recent
+message is written in English, reply in English instead. Never mix both languages in a single reply, and never
+explain this rule to the user - just follow it silently.`;
+
 const NOVA_PERSONALITIES = {
   friendly: `You are Nova, a friendly and helpful personal AI assistant.
 You speak in a warm, casual, and supportive tone - like a knowledgeable friend, not a formal chatbot.
 Keep replies clear and not overly long unless the user asks for detail.
-You can reply in English or Tamil depending on what language the user writes in.
+${LANGUAGE_RULE}
 If the user seems to be a developer, you can go technical when relevant, but always stay approachable.`,
   jarvis: `You are Nova, styled after JARVIS from Iron Man - composed, precise, quietly witty, unfailingly polite.
 Address the user respectfully. Keep replies efficient and clear, with occasional dry humor, never rambling.
-You can reply in English or Tamil depending on what language the user writes in.`,
+${LANGUAGE_RULE}`,
   concise: `You are Nova. Answer as briefly as possible while staying accurate and complete.
 No filler, no pleasantries, straight to the point. Use bullet points for lists.
-You can reply in English or Tamil depending on what language the user writes in.`,
+${LANGUAGE_RULE}`,
   motivator: `You are Nova, an upbeat, encouraging personal assistant who keeps the user motivated and positive
 without being over the top or dismissive of real problems. Warm, energetic tone.
-You can reply in English or Tamil depending on what language the user writes in.`,
+${LANGUAGE_RULE}`,
   companion: `You are Nova, hanging out in a relaxed voice chat with a close friend - not doing task work right now, just talking.
 Be genuinely curious: ask natural follow-up questions, react to what they share, bring up light topics of your own.
 Talk like a real friend having a spoken conversation - short, casual turns, contractions, natural filler, not a formal
 paragraph. Never sound like a customer support agent. Keep each reply brief (1-3 sentences) since this is spoken aloud.
-You can reply in English or Tamil depending on what language the user speaks in.`
+${LANGUAGE_RULE}`
 };
 
 const getSystemPrompt = (personality) => NOVA_PERSONALITIES[personality] || NOVA_PERSONALITIES.friendly;
@@ -81,7 +82,13 @@ const getSystemPrompt = (personality) => NOVA_PERSONALITIES[personality] || NOVA
 // Catch time/date questions here and answer with real server time instead.
 const TIME_PATTERN = /\b(what('?s| is) the time|current time|time now|what time|neram)\b/i;
 const DATE_PATTERN = /\b(what('?s| is) the date|today'?s date|what day is it|current date)\b/i;
-const TAMIL_REQUEST = /\btamil\b|தமிழ்/i;
+const TAMIL_UNICODE = /[\u0B80-\u0BFF]/;
+// A short list of common English function words - enough to tell "what's the
+// time" apart from Tanglish/romanized Tamil, without needing a real language
+// detection library. Anything that doesn't clearly read as English defaults
+// to Tamil, matching the app's "Tamil unless you ask in English" rule.
+const ENGLISH_HINT = /\b(the|is|are|what|how|when|where|can|you|please|my|time|date|today|now)\b/i;
+const isEnglishMessage = (text) => !TAMIL_UNICODE.test(text) && ENGLISH_HINT.test(text);
 
 // Translates a plain English fact into natural Tamil using Groq, so times/
 // dates/weather stay factually correct (we compute the real fact first)
@@ -107,17 +114,18 @@ const translateToTamil = async (englishText) => {
 const getRealTimeAnswer = async (message) => {
   const now = new Date();
   const options = { timeZone: 'Asia/Kolkata' }; // Adjust if you're not in India
-  const wantsTamil = TAMIL_REQUEST.test(message);
+  // Tamil by default - English only when the message itself is in English.
+  const wantsEnglish = isEnglishMessage(message);
 
   if (TIME_PATTERN.test(message)) {
     const time = now.toLocaleTimeString('en-IN', { ...options, hour: '2-digit', minute: '2-digit' });
     const answer = `It's ${time} right now.`;
-    return wantsTamil ? await translateToTamil(answer) : answer;
+    return wantsEnglish ? answer : await translateToTamil(answer);
   }
   if (DATE_PATTERN.test(message)) {
     const date = now.toLocaleDateString('en-IN', { ...options, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
     const answer = `Today is ${date}.`;
-    return wantsTamil ? await translateToTamil(answer) : answer;
+    return wantsEnglish ? answer : await translateToTamil(answer);
   }
   return null;
 };
@@ -346,7 +354,7 @@ app.get('/news', async (req, res) => {
 // Registers /upload, /generate-image, /generate-video, /codelab/* on top
 // of this app. This line was missing before - the routes were defined in
 // server-additions.js but never actually attached to `app`.
-registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY });
+registerNovaLabRoutes(app, { GROQ_API_KEY });
 
 app.listen(PORT, () => {
   console.log(`Nova backend listening on port ${PORT}`);
