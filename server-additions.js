@@ -15,11 +15,22 @@
 
 const multer = require('multer');
 const AdmZip = require('adm-zip');
+// Pure-JS (WASM) RAR extractor - no system `unrar` binary needed, so this
+// works on Render/any host exactly like adm-zip does. Used so the Lab tab
+// can accept .rar project archives, not just .zip.
+const unrar = require('node-unrar-js');
 const { v4: uuid } = require('uuid');
 const fs = require('fs');
 const path = require('path');
 const { Document, Packer, Paragraph, TextRun, HeadingLevel } = require('docx');
 const PDFDocument = require('pdfkit');
+// Free, no-API-key neural TTS - talks to the same speech service that
+// powers Microsoft Edge's "Read Aloud" feature. Used by /tts below to give
+// Nova a natural-sounding voice (ta-IN-PallaviNeural for Tamil, en-US-AvaNeural
+// for English) instead of the phone's built-in TTS engine, which is why the
+// Tamil voice sounded robotic before - expo-speech can only ever use
+// whatever voices are already installed on the device.
+const { EdgeTTS } = require('node-edge-tts');
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const PROJECT_DIR = path.join(__dirname, 'projects');
@@ -99,6 +110,14 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
 
   const HF_VIDEO_MODEL = 'damo-vilab/text-to-video-ms-1.7b';
   const HF_IMAGE_MODEL = 'stabilityai/stable-diffusion-2-1';
+  // Hugging Face fully decommissioned the old api-inference.huggingface.co
+  // "Serverless Inference API" host - it now returns 410/refuses to
+  // resolve. Every call has to go through the new Inference Providers
+  // router instead, at the same /models/<id> path just under a different
+  // host + /hf-inference prefix. This was the actual cause of "Video
+  // generation failed: fetch failed" (a raw network failure, since the old
+  // host stopped responding at all - not just an HTTP error status).
+  const HF_INFERENCE_BASE = 'https://router.huggingface.co/hf-inference/models';
 
   function runFfmpeg(args) {
     return new Promise((resolve, reject) => {
@@ -136,7 +155,7 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
     }
     let lastErr;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const response = await fetch(`https://api-inference.huggingface.co/models/${model}`, {
+      const response = await fetch(`${HF_INFERENCE_BASE}/${model}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -561,6 +580,26 @@ Content:\n\n${excerpt}`
   // PDF, Word doc, plain text, or anything else. Detects type and gives an
   // AI-generated review/summary instead of just running the full project
   // pipeline (which needs a ZIP).
+  // Shared by /codelab/analyze-file, /codelab/analyze-text, and
+  // /codelab/fix-file - reads a file's text content by extension/mimetype.
+  // Returns null for types that don't have text extraction wired up yet
+  // (images, old .doc) so callers can respond appropriately.
+  async function extractTextFromFile(file, ext, mime) {
+    if (ext === '.pdf' || mime === 'application/pdf') {
+      const pdfParse = require('pdf-parse');
+      const buf = fs.readFileSync(file.path);
+      const parsed = await pdfParse(buf);
+      return parsed.text || '';
+    }
+    if (ext === '.docx' || mime.includes('wordprocessingml')) {
+      const mammoth = require('mammoth');
+      const result = await mammoth.extractRawText({ path: file.path });
+      return result.value || '';
+    }
+    if (ext === '.doc') return null;
+    return fs.readFileSync(file.path, 'utf8');
+  }
+
   app.post('/codelab/analyze-file', async (req, res) => {
     const { fileId } = req.body;
     const file = fileIndex.get(fileId);
@@ -569,8 +608,8 @@ Content:\n\n${excerpt}`
       const ext = path.extname(file.name).toLowerCase();
       const mime = file.mimeType || '';
 
-      if (ext === '.zip' || mime.includes('zip')) {
-        const result = await analyzeZipFile(file.path, fileId);
+      if (ext === '.zip' || ext === '.rar' || mime.includes('zip') || mime.includes('rar')) {
+        const result = await analyzeZipFile(file.path, fileId, ext === '.rar' ? '.rar' : '.zip');
         return res.json({ kind: 'project', ...result });
       }
 
@@ -585,25 +624,13 @@ Content:\n\n${excerpt}`
         });
       }
 
-      let text = '';
-      if (ext === '.pdf' || mime === 'application/pdf') {
-        const pdfParse = require('pdf-parse');
-        const buf = fs.readFileSync(file.path);
-        const parsed = await pdfParse(buf);
-        text = parsed.text || '';
-      } else if (ext === '.docx' || mime.includes('wordprocessingml')) {
-        const mammoth = require('mammoth');
-        const result = await mammoth.extractRawText({ path: file.path });
-        text = result.value || '';
-      } else if (ext === '.doc') {
+      const text = await extractTextFromFile(file, ext, mime);
+      if (text === null) {
         return res.json({
           kind: 'document',
           name: file.name,
           summary: 'Old-format .doc files aren\'t supported for text extraction yet - please convert to .docx or .pdf and try again.'
         });
-      } else {
-        // Code file or plain text
-        text = fs.readFileSync(file.path, 'utf8');
       }
 
       const isCode = CODE_EXT.includes(ext);
@@ -622,16 +649,111 @@ Extracted text:\n\n${trimmed}`;
 
       res.json({
         kind: isCode ? 'code-file' : 'document',
+        fileId,
         name: file.name,
         mimeType: mime,
         lineCount,
         language: result.language || (isCode ? 'unknown' : 'N/A'),
         summary: result.summary || 'No summary available.',
         issues: result.issues || [],
-        notableFindings: result.notableFindings || []
+        notableFindings: result.notableFindings || [],
+        // Only code/text files can be sent through /codelab/fix-file - lets
+        // the app decide whether to show the "Fix entire file with AI" button.
+        fixable: isCode
       });
     } catch (err) {
       res.status(500).json({ error: `File analysis failed: ${err.message}` });
+    }
+  });
+
+  // ---------------- Paste-code analyzer ----------------
+  // Same analysis as /codelab/analyze-file, but for code pasted directly
+  // into the app instead of picked from a file/drag-and-drop - no
+  // multipart upload needed, just JSON. Registers a real fileId so the
+  // result can still be sent through /codelab/fix-file afterwards.
+  app.post('/codelab/analyze-text', async (req, res) => {
+    const { name, content } = req.body;
+    if (!content || !content.trim()) return res.status(400).json({ error: 'content is required.' });
+    const safeName = (name && name.trim()) || 'pasted-code.txt';
+    try {
+      const fileId = uuid();
+      const finalPath = path.join(UPLOAD_DIR, fileId + path.extname(safeName));
+      fs.writeFileSync(finalPath, content, 'utf8');
+      fileIndex.set(fileId, { path: finalPath, name: safeName, mimeType: 'text/plain' });
+
+      const ext = path.extname(safeName).toLowerCase();
+      const isCode = CODE_EXT.includes(ext) || !ext;
+      const trimmed = content.slice(0, 8000);
+      const lineCount = content.split('\n').length;
+
+      const prompt = `You are a senior code reviewer. Review this pasted ${ext || 'code'} snippet (${lineCount} lines). Respond ONLY with JSON:
+{"language": "detected language", "summary": "2-3 sentence summary of what this code does", "issues": [{"title": "...", "severity": "critical|high|medium|low", "line": 0, "explanation": "..."}]}
+Code:\n\n${trimmed}`;
+      const result = await askGroqForJSON(GROQ_API_KEY, prompt);
+
+      res.json({
+        kind: 'code-file',
+        fileId,
+        name: safeName,
+        lineCount,
+        language: result.language || 'unknown',
+        summary: result.summary || 'No summary available.',
+        issues: result.issues || [],
+        fixable: true
+      });
+    } catch (err) {
+      res.status(500).json({ error: `Analysis failed: ${err.message}` });
+    }
+  });
+
+  // ---------------- Full-file AI fix ----------------
+  // Rewrites an ENTIRE single file to fix every issue found (not just one
+  // diff at a time like /codelab/fix + /codelab/apply-fix, which are for
+  // per-bug fixes inside a ZIP project). If the file is really a bundle of
+  // more than one language (e.g. a single .html file with a large inline
+  // <script>/<style>), the model is asked to split the fixed result into
+  // separate files by language - each gets written to disk and served back
+  // as its own downloadable file, same as any other generated file here.
+  app.post('/codelab/fix-file', async (req, res) => {
+    const { fileId } = req.body;
+    const file = fileIndex.get(fileId);
+    if (!file) return res.status(404).json({ error: 'Unknown fileId - analyze the file first.' });
+    try {
+      const ext = path.extname(file.name).toLowerCase();
+      const mime = file.mimeType || '';
+      const text = await extractTextFromFile(file, ext, mime);
+      const fixable = CODE_EXT.includes(ext) || ext === '' || ext === '.txt';
+      if (text === null || !fixable) {
+        return res.status(400).json({ error: 'Only code/text files can be auto-fixed - this file type isn\'t supported for a full-file fix.' });
+      }
+
+      const baseName = path.basename(file.name, ext) || 'fixed';
+      const prompt = `You are a senior software engineer. Fix EVERY bug, error, and bad practice in this file so it runs correctly with zero errors. Keep the original intent and behavior, just make it correct, safe, and clean.
+
+If this single file actually bundles more than one language together (for example a .html file with a large inline <style> block and/or <script> block), split your fixed result into SEPARATE files - one per language (e.g. "${baseName}.html", "${baseName}.css", "${baseName}.js") - each containing only that language's fixed code, wired together correctly (e.g. the HTML links the separate .css/.js files instead of inlining them). Otherwise, just return the one fixed file with the same name.
+
+Respond ONLY with JSON, no markdown fences:
+{"fixSummary": "2-4 sentence summary of what was wrong and what you fixed", "files": [{"filename": "${file.name}", "language": "...", "content": "the complete fixed file content"}]}
+
+Original file (${file.name}):\n\n${text.slice(0, 12000)}`;
+
+      const result = await askGroqForJSON(GROQ_API_KEY, prompt, 0.2);
+      const outFiles = Array.isArray(result.files) ? result.files : [];
+      if (outFiles.length === 0) throw new Error('The model did not return any fixed file content.');
+
+      const written = outFiles.map((f) => {
+        const outName = f.filename || file.name;
+        const outId = uuid();
+        const outExt = path.extname(outName) || ext || '.txt';
+        const finalPath = path.join(UPLOAD_DIR, `${outId}${outExt}`);
+        fs.writeFileSync(finalPath, f.content || '', 'utf8');
+        fileIndex.set(outId, { path: finalPath, name: outName, mimeType: 'text/plain' });
+        return { name: outName, language: f.language || 'unknown', url: `/files/${path.basename(finalPath)}`, fileId: outId };
+      });
+
+      res.json({ fixSummary: result.fixSummary || 'Fixed.', files: written });
+    } catch (err) {
+      res.status(500).json({ error: `Fix failed: ${err.message}` });
     }
   });
 
@@ -707,11 +829,31 @@ Code:\n\n${codeSample}`;
     }
   });
 
-  // Shared by /codelab/analyze and /codelab/analyze-url (GitHub repos)
-  async function analyzeZipFile(zipPath, fileId) {
+  // Extracts a .zip or .rar archive to destDir. Split out from
+  // analyzeArchiveFile so both the archive AND folder-of-files paths (see
+  // /codelab/analyze-file) can reuse it.
+  async function extractArchive(archivePath, ext, destDir) {
+    if (ext === '.rar') {
+      const data = Uint8Array.from(fs.readFileSync(archivePath)).buffer;
+      const extractor = await unrar.createExtractorFromData({ data });
+      const { files } = extractor.extract(); // no `files` filter = extract everything
+      for (const f of files) {
+        if (!f.fileHeader || f.fileHeader.flags?.directory || !f.extraction) continue;
+        const outPath = path.join(destDir, f.fileHeader.name);
+        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+        fs.writeFileSync(outPath, Buffer.from(f.extraction));
+      }
+    } else {
+      new AdmZip(archivePath).extractAllTo(destDir, true);
+    }
+  }
+
+  // Shared by /codelab/analyze and /codelab/analyze-url (GitHub repos) -
+  // handles both .zip and .rar project archives (see extractArchive above).
+  async function analyzeZipFile(zipPath, fileId, ext = '.zip') {
     const projectDir = path.join(PROJECT_DIR, fileId);
     fs.mkdirSync(projectDir, { recursive: true });
-    new AdmZip(zipPath).extractAllTo(projectDir, true);
+    await extractArchive(zipPath, ext, projectDir);
     const allFiles = walk(projectDir);
     const language = detectLanguage(allFiles);
     const framework = detectFramework(projectDir, allFiles);
@@ -719,6 +861,42 @@ Code:\n\n${codeSample}`;
     projectIndex.set(fileId, { dir: projectDir, structure, language, framework, files: allFiles, bugs: [] });
     return { language, framework, structure, fileCount: allFiles.length };
   }
+
+  // Tamil Unicode block is U+0B80-U+0BFF - same quick script check used on
+  // the app side (utils/novaVoice.js) to decide which language/voice to
+  // speak a reply in.
+  const TAMIL_SCRIPT = /[\u0B80-\u0BFF]/;
+
+  // Generates natural-sounding speech audio for a line of text and returns
+  // a URL the app can play (same /files static route /upload already uses).
+  // Free, no API key - see the node-edge-tts require above for why this
+  // sounds far better than the device's own TTS engine, especially in Tamil.
+  app.post('/tts', async (req, res) => {
+    const { text, lang } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: 'text is required.' });
+
+    const isTamil = lang === 'ta' || lang === 'ta-IN' || TAMIL_SCRIPT.test(text);
+    const voice = isTamil ? 'ta-IN-PallaviNeural' : 'en-US-AvaNeural';
+    const voiceLang = isTamil ? 'ta-IN' : 'en-US';
+
+    try {
+      const fileId = uuid();
+      const finalPath = path.join(UPLOAD_DIR, `${fileId}.mp3`);
+      const tts = new EdgeTTS({
+        voice,
+        lang: voiceLang,
+        outputFormat: 'audio-24khz-96kbitrate-mono-mp3',
+        // Slightly warmer/gentler than the raw default, matching the pitch/
+        // rate tuning speakAsNova() used to apply on-device.
+        pitch: '+5Hz',
+        rate: isTamil ? '-8%' : 'default'
+      });
+      await tts.ttsPromise(text, finalPath);
+      res.json({ audioUrl: `/files/${fileId}.mp3`, voice });
+    } catch (err) {
+      res.status(500).json({ error: `TTS failed: ${err.message}` });
+    }
+  });
 };
 
 // ------------------------- helpers -------------------------
