@@ -17,7 +17,8 @@ app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GEMINI_API_KEY =process.env.GEMINI_API_KEY; // optional - only /generate-image needs this
+const GEMINI_API_KEY =process.env.GEMINI_API_KEY; // optional - only /generate-image and /vision-search need this
+const HF_API_KEY = process.env.HF_API_KEY; // optional - only /generate-video needs this (free, no Gemini)
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
 if (!GROQ_API_KEY) {
@@ -26,7 +27,11 @@ if (!GROQ_API_KEY) {
 }
 
 if (!GEMINI_API_KEY) {
-  console.warn('WARNING: GEMINI_API_KEY is missing. /generate-image will return a "not configured" error until you add it.');
+  console.warn('WARNING: GEMINI_API_KEY is missing. /generate-image and /vision-search will return a "not configured" error until you add it.');
+}
+
+if (!HF_API_KEY) {
+  console.warn('WARNING: HF_API_KEY is missing. /generate-video will return a "not configured" error until you add a free token from huggingface.co/settings/tokens.');
 }
 
 app.use(cors());
@@ -75,7 +80,15 @@ paragraph. Never sound like a customer support agent. Keep each reply brief (1-3
 You can reply in English or Tamil depending on what language the user speaks in.`
 };
 
-const getSystemPrompt = (personality) => NOVA_PERSONALITIES[personality] || NOVA_PERSONALITIES.friendly;
+// Applied to every personality - handles messy/typo'd input the same way
+// a sharp human assistant would: understand the intended meaning and just
+// answer that, instead of getting stuck on the wording or asking the user
+// to rephrase.
+const TYPO_TOLERANCE_INSTRUCTION = `
+If the user's message has spelling mistakes, typos, or awkward grammar, silently work out what they actually meant and answer THAT - don't point out the mistake, don't ask them to rephrase, and don't answer a literal misreading of a garbled word.`;
+
+const getSystemPrompt = (personality) =>
+  (NOVA_PERSONALITIES[personality] || NOVA_PERSONALITIES.friendly) + TYPO_TOLERANCE_INSTRUCTION;
 
 // AI models have no access to the real clock/calendar - they can only guess.
 // Catch time/date questions here and answer with real server time instead.
@@ -346,7 +359,7 @@ app.get('/news', async (req, res) => {
 // Registers /upload, /generate-image, /generate-video, /codelab/* on top
 // of this app. This line was missing before - the routes were defined in
 // server-additions.js but never actually attached to `app`.
-registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY });
+registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY });
 
 app.listen(PORT, () => {
   console.log(`Nova backend listening on port ${PORT}`);

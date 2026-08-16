@@ -36,7 +36,7 @@ const projectIndex = new Map();
 
 const CODE_EXT = ['.js', '.jsx', '.ts', '.tsx', '.py', '.php', '.java', '.c', '.cpp', '.cs', '.go', '.rb', '.swift', '.kt', '.html', '.css'];
 
-module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY }) {
+module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY }) {
 
   app.post('/upload', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file received.' });
@@ -74,26 +74,31 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
     }
   });
 
-  // ---------------- Video generation (free, reliable, 2+ minutes) ----------------
-  // Honest technical note: there is no free API anywhere (Hugging Face
-  // included) that generates 2 continuous minutes of true AI motion video -
-  // free video models cap out around 2-4 seconds per generation, and
-  // chaining many of those together is slow, rate-limit-prone, and the
-  // motion doesn't connect between clips anyway.
+  // ---------------- Video generation (Hugging Face - free, no Gemini) ----------------
+  // Previously this called Gemini (gemini-2.5-flash-image) for every scene
+  // image, which is why it broke with a 403 the moment the Gemini key was
+  // rate-limited / suspended / missing. It's been swapped for Hugging
+  // Face's free Inference API end-to-end - no Gemini call anywhere in this
+  // route anymore.
   //
-  // What actually works reliably for free: break the topic into scenes,
-  // generate one AI image per scene (Gemini - already used by
-  // /generate-image above), then use ffmpeg to turn each image into a
-  // slow zoom/pan ("Ken Burns") clip and concatenate them into one .mp4
-  // that hits your target length exactly. No third-party video API in the
-  // critical path = nothing there to rate-limit or randomly fail.
+  // Two-tier approach, both entirely free:
+  //  1. Try a real Hugging Face text-to-video model directly (one call,
+  //     returns actual motion video). Free-tier video models are short
+  //     (a few seconds) and sometimes need to "warm up" (503 while loading).
+  //  2. If that model is unavailable/still loading after a couple of
+  //     retries, fall back to the scene-image + ffmpeg Ken-Burns pipeline -
+  //     same idea as before, but the scene images now come from a free
+  //     Hugging Face text-to-image model instead of Gemini.
   const ffmpegPath = require('ffmpeg-static');
   const { execFile } = require('child_process');
 
-  const SCENE_SECONDS = 10;         // length of each still-image clip
+  const SCENE_SECONDS = 10;         // length of each still-image clip (fallback pipeline)
   const TARGET_SECONDS = 130;       // comfortably over the requested 2 min (120s)
   const SCENE_COUNT = Math.ceil(TARGET_SECONDS / SCENE_SECONDS); // 13 scenes
-  const IMAGE_CONCURRENCY = 3;      // parallel Gemini calls - fast, but under free-tier rate limits
+  const IMAGE_CONCURRENCY = 2;      // parallel HF calls - free tier is easily rate-limited, keep this low
+
+  const HF_VIDEO_MODEL = 'damo-vilab/text-to-video-ms-1.7b';
+  const HF_IMAGE_MODEL = 'stabilityai/stable-diffusion-2-1';
 
   function runFfmpeg(args) {
     return new Promise((resolve, reject) => {
@@ -105,8 +110,8 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
   }
 
   // Runs `fn` over `items` with at most `limit` in flight at once - keeps
-  // us comfortably under Gemini's free-tier requests-per-minute limit
-  // instead of firing 13 requests at the same instant.
+  // us comfortably under Hugging Face's free-tier rate limit instead of
+  // firing every request at the same instant.
   async function mapWithConcurrency(items, limit, fn) {
     const results = new Array(items.length);
     let next = 0;
@@ -120,46 +125,99 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
     return results;
   }
 
-  // One Gemini image call, with a couple of retries on rate-limit (429)
-  // or transient errors so one flaky call doesn't sink the whole video.
-  async function generateSceneImage(sceneText) {
-    let lastErr;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_API_KEY}`,
-          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: sceneText }] }] }) }
-        );
-        if (response.status === 429) throw new Error('rate limited');
-        if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(`Gemini responded ${response.status}: ${errText.slice(0, 150)}`);
-        }
-        const data = await response.json();
-        const imagePart = data?.candidates?.[0]?.content?.parts?.find((p) => p.inlineData);
-        if (!imagePart) throw new Error('Model did not return image data.');
-        return Buffer.from(imagePart.inlineData.data, 'base64');
-      } catch (e) {
-        lastErr = e;
-        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1))); // backoff before retrying
-      }
+  // Shared Hugging Face Inference API caller. HF's free tier commonly
+  // returns 503 with { estimated_time } while a model "cold starts" on
+  // their servers - this waits that long (capped) and retries instead of
+  // failing on the very first call, which is the most common cause of
+  // free HF requests looking "broken" when they're really just warming up.
+  async function callHuggingFace(model, prompt, { maxAttempts = 4 } = {}) {
+    if (!HF_API_KEY) {
+      throw new Error('HUGGINGFACE_API_KEY is not configured on the backend.');
     }
-    throw lastErr;
+    let lastErr;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const response = await fetch(`https://api-inference.huggingface.co/models/${model}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${HF_API_KEY}`
+        },
+        body: JSON.stringify({ inputs: prompt, options: { wait_for_model: true } })
+      });
+
+      if (response.ok) {
+        const arrayBuffer = await response.arrayBuffer();
+        return Buffer.from(arrayBuffer);
+      }
+
+      if (response.status === 503) {
+        let waitSeconds = 8;
+        try {
+          const body = await response.json();
+          if (body?.estimated_time) waitSeconds = Math.min(body.estimated_time, 30);
+        } catch (e) { /* no JSON body - just use the default wait */ }
+        lastErr = new Error('Model is still loading on Hugging Face.');
+        await new Promise((r) => setTimeout(r, waitSeconds * 1000));
+        continue;
+      }
+
+      if (response.status === 429) {
+        lastErr = new Error('Hugging Face free-tier rate limit hit.');
+        await new Promise((r) => setTimeout(r, 3000 * (attempt + 1)));
+        continue;
+      }
+
+      const errText = await response.text();
+      throw new Error(`Hugging Face responded ${response.status}: ${errText.slice(0, 200)}`);
+    }
+    throw lastErr || new Error('Hugging Face request failed after retries.');
+  }
+
+  async function generateSceneImage(sceneText) {
+    return callHuggingFace(HF_IMAGE_MODEL, sceneText);
+  }
+
+  // Tries the direct text-to-video model first - one call, real motion
+  // video, no ffmpeg needed. Returns null (instead of throwing) if it
+  // isn't usable right now, so the caller can fall back cleanly.
+  async function tryDirectHuggingFaceVideo(prompt) {
+    try {
+      const buffer = await callHuggingFace(HF_VIDEO_MODEL, prompt, { maxAttempts: 3 });
+      // A successful video response is at least a few KB - a tiny buffer
+      // usually means HF sent back a JSON error we didn't catch above.
+      if (!buffer || buffer.length < 2000) return null;
+      return buffer;
+    } catch (e) {
+      return null;
+    }
   }
 
   app.post('/generate-video', async (req, res) => {
     const { prompt } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
-    if (!GEMINI_API_KEY) {
-      return res.status(501).json({ error: 'Video generation needs GEMINI_API_KEY - it generates the scene images the video is built from.' });
+    if (!HF_API_KEY) {
+      return res.status(501).json({ error: 'Video generation needs HUGGINGFACE_API_KEY - create a free token at huggingface.co/settings/tokens and add it to your backend .env / Render environment variables.' });
     }
 
+    // 1. Try a real AI video model directly (free, but short clips).
+    const directVideo = await tryDirectHuggingFaceVideo(prompt);
+    if (directVideo) {
+      const finalId = uuid();
+      const finalPath = path.join(UPLOAD_DIR, `${finalId}.mp4`);
+      fs.writeFileSync(finalPath, directVideo);
+      return res.json({
+        videoUrl: `/files/${finalId}.mp4`,
+        caption: "Here's your video, generated with a free Hugging Face text-to-video model."
+      });
+    }
+
+    // 2. Fallback: scene images (Hugging Face) stitched into a Ken-Burns
+    // slideshow video with ffmpeg - still free, still no Gemini involved.
     const jobId = uuid();
     const jobDir = path.join(UPLOAD_DIR, `video-${jobId}`);
     fs.mkdirSync(jobDir, { recursive: true });
 
     try {
-      // 1. Split the topic into SCENE_COUNT short visual scenes.
       const scenesResult = await askGroqForJSON(
         GROQ_API_KEY,
         `Break this into exactly ${SCENE_COUNT} short, visually distinct scenes for a slideshow-style video: "${prompt}".
@@ -167,17 +225,12 @@ Respond ONLY with JSON (no markdown fences): {"scenes": ["scene 1 visual descrip
 Exactly ${SCENE_COUNT} items. Each is one concise sentence describing what to SHOW, written for an image generator, forming a coherent visual progression from start to end.`
       );
       const scenes = Array.isArray(scenesResult.scenes) ? scenesResult.scenes.slice(0, SCENE_COUNT) : [];
-      while (scenes.length < SCENE_COUNT) scenes.push(prompt); // pad if the model returned fewer than asked
+      while (scenes.length < SCENE_COUNT) scenes.push(prompt);
       if (scenes.length === 0) throw new Error('Could not break the prompt into scenes.');
 
-      // 2. Generate one image per scene (a few in parallel at a time).
       const imageBuffers = await mapWithConcurrency(scenes, IMAGE_CONCURRENCY, generateSceneImage);
       imageBuffers.forEach((buf, i) => fs.writeFileSync(path.join(jobDir, `scene${i}.png`), buf));
 
-      // 3. Turn each image into a Ken-Burns clip of SCENE_SECONDS length.
-      // Every clip is encoded with identical size/fps/codec so the final
-      // concat step can just copy the streams (fast, and nothing to
-      // mismatch/fail on).
       const fps = 25;
       const frames = SCENE_SECONDS * fps;
       for (let i = 0; i < scenes.length; i++) {
@@ -192,7 +245,6 @@ Exactly ${SCENE_COUNT} items. Each is one concise sentence describing what to SH
         ]);
       }
 
-      // 4. Concatenate all clips into the final video.
       const listPath = path.join(jobDir, 'list.txt');
       const listContent = scenes.map((_, i) => `file '${path.join(jobDir, `clip${i}.mp4`)}'`).join('\n');
       fs.writeFileSync(listPath, listContent);
@@ -200,13 +252,12 @@ Exactly ${SCENE_COUNT} items. Each is one concise sentence describing what to SH
       const finalPath = path.join(UPLOAD_DIR, `${finalId}.mp4`);
       await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', finalPath]);
 
-      // Clean up the per-job scratch folder, keep only the final file.
       fs.rmSync(jobDir, { recursive: true, force: true });
 
       res.json({
         videoUrl: `/files/${finalId}.mp4`,
         durationSeconds: SCENE_COUNT * SCENE_SECONDS,
-        caption: `Here's your ${SCENE_COUNT * SCENE_SECONDS}-second video.`
+        caption: `Here's your ${SCENE_COUNT * SCENE_SECONDS}-second video (Hugging Face images + slideshow, since the direct video model wasn't available right now).`
       });
     } catch (err) {
       fs.rmSync(jobDir, { recursive: true, force: true });
@@ -233,20 +284,26 @@ Exactly ${SCENE_COUNT} items. Each is one concise sentence describing what to SH
       // regenerating something unrelated.
       const isRevision = revision && revision.previousContent && typeof revision.instruction === 'string';
       const structuredPrompt = isRevision
-        ? `You are revising a document you previously wrote. Here is the CURRENT content as JSON:
+        ? `You are precisely editing a document you previously wrote. Here is the CURRENT content as JSON - treat it as the source of truth for anything the user did NOT ask to change:
 ${JSON.stringify(revision.previousContent)}
 
-The user's requested change: "${revision.instruction}"
+The user's requested change (their wording may contain typos or awkward phrasing - infer their real intent, don't nitpick the wording): "${revision.instruction}"
 
-Apply that change and return the FULL updated document (not just the changed part). Keep everything the user didn't ask to change as close to the original as sensible.
+RULES:
+1. Copy every section, heading, paragraph, and bullet EXACTLY as given above, UNCHANGED, except the specific part(s) the instruction targets.
+2. Only rewrite the smallest amount of content needed to satisfy the instruction (e.g. if they say "make the second paragraph shorter", only that paragraph changes).
+3. If the instruction is genuinely ambiguous about which part it targets, make the most reasonable interpretation given the document's content - do not ask a clarifying question, just make your best correct edit.
+4. Still return the FULL document (all sections), not just the changed part.
 Respond ONLY with JSON in this exact shape (no markdown fences):
 {"title": "Document title", "sections": [{"heading": "Optional heading or empty string", "paragraphs": ["paragraph text", "..."], "bullets": ["optional bullet", "..."]}]}`
-        : `You are a professional document writer. Write the full content for this request: "${prompt}".
+        : `You are a professional document writer. Write the full content for this request (their wording may contain typos or awkward phrasing - infer their real intent and write what they actually meant to ask for): "${prompt}".
 Respond ONLY with JSON in this exact shape (no markdown fences):
 {"title": "Document title", "sections": [{"heading": "Optional heading or empty string", "paragraphs": ["paragraph text", "..."], "bullets": ["optional bullet", "..."]}]}
 Write complete, well-organized, ready-to-use content - not a description of what the document should contain.`;
 
-      const structured = await askGroqForJSON(GROQ_API_KEY, structuredPrompt);
+      // Lower temperature on revisions - we want a precise, minimal edit,
+      // not a creative rewrite of the whole document.
+      const structured = await askGroqForJSON(GROQ_API_KEY, structuredPrompt, isRevision ? 0.15 : 0.3);
 
       const title = structured.title || 'Document';
       const sections = Array.isArray(structured.sections) ? structured.sections : [];
@@ -706,7 +763,7 @@ async function translateText(apiKey, text, targetLang = 'Tamil') {
 // Groq's chat-completions endpoint is OpenAI-compatible - same shape as
 // the OpenAI SDK, just a different base URL. json_object mode plus the
 // "respond ONLY with JSON" prompts keep output parseable.
-async function askGroqForJSON(apiKey, prompt) {
+async function askGroqForJSON(apiKey, prompt, temperature = 0.3) {
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -717,7 +774,7 @@ async function askGroqForJSON(apiKey, prompt) {
       model: 'llama-3.3-70b-versatile',
       messages: [{ role: 'user', content: prompt }],
       response_format: { type: 'json_object' },
-      temperature: 0.3
+      temperature
     })
   });
   const data = await response.json();
