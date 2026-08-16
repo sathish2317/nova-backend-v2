@@ -419,7 +419,50 @@ Write complete, well-organized, ready-to-use content - not a description of what
       try { parsed = JSON.parse(clean); } catch (e) { parsed = { subject: 'Unknown subject', description: clean.slice(0, 400) || 'Could not analyze this photo.' }; }
 
       const subject = parsed.subject || 'Unknown subject';
-      const description = parsed.description || 'No description available.';
+      const briefDescription = parsed.description || 'No description available.';
+
+      // "Deep search" step - a SECOND Gemini call, this time with Google
+      // Search grounding turned on (tools: [{ google_search: {} }]).
+      // Gemini's vision call above only looks at the pixels; it has no
+      // way to pull in live, current facts. This second call takes the
+      // subject it identified and actually searches Google for it, so
+      // the final description is grounded in real, current web results
+      // instead of only what the model already "knew". Same GEMINI_API_KEY,
+      // still free-tier - if grounding fails for any reason (quota, etc.)
+      // this falls back to the plain description above instead of failing
+      // the whole request.
+      let description = briefDescription;
+      let sources = [];
+      try {
+        const groundedRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{
+                parts: [{
+                  text: `Using Google Search, find current, accurate, detailed information about "${subject}" (this was identified from a photo someone just took). Write a thorough but easy-to-follow 4-6 sentence explanation: what it is, key facts, and anything notable or currently relevant. Write it directly for the person who took the photo, not as a search-result summary.`
+                }]
+              }],
+              tools: [{ google_search: {} }]
+            })
+          }
+        );
+        if (groundedRes.ok) {
+          const groundedData = await groundedRes.json();
+          const groundedText = groundedData?.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text;
+          if (groundedText) description = groundedText.trim();
+          const chunks = groundedData?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+          sources = chunks
+            .map((c) => ({ title: c.web?.title, url: c.web?.uri }))
+            .filter((s) => s.url)
+            .slice(0, 5);
+        }
+      } catch (e) {
+        // Grounded search failed - `description` already holds the
+        // fallback from the vision call, so the request still succeeds.
+      }
 
       // Best-effort Tamil narration - if translation fails for any reason,
       // fall back to the English text rather than failing the whole request.
@@ -428,7 +471,7 @@ Write complete, well-organized, ready-to-use content - not a description of what
         translateText(GROQ_API_KEY, description)
       ]);
 
-      res.json({ subject, description, subjectTamil, descriptionTamil });
+      res.json({ subject, description, subjectTamil, descriptionTamil, sources });
     } catch (err) {
       res.status(500).json({ error: `Visual search failed: ${err.message}` });
     }
