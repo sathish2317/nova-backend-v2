@@ -1,11 +1,12 @@
 /**
  * NOVA BACKEND ADDITIONS
  * ------------------------------------------------------------------
- * Everything in this file runs entirely on GROQ_API_KEY (the same key
- * used for chat) plus fully keyless free services - no Gemini, no second
- * API key to manage:
- *  - /generate-image    -> Pollinations.ai (free, no signup, no key)
- *  - /vision-search      -> Groq's qwen/qwen3.6-27b vision model (your existing GROQ_API_KEY)
+ * Text/reasoning routes now run on Groq (GROQ_API_KEY) instead of Gemini.
+ * Image generation has no Groq equivalent, so /generate-image still uses
+ * GEMINI_API_KEY if you pass one in - omit it and that route just returns
+ * a clear "not configured" error instead of failing silently.
+ *
+ * Also in this file:
  *  - /generate-document  -> real downloadable .docx or .pdf files (not just chat text)
  *  - /codelab/analyze-url -> analyze a GitHub repo URL or any web page/file URL
  *  - /codelab/analyze-file -> analyze a single uploaded file (code, PDF, DOCX, txt)
@@ -35,7 +36,7 @@ const projectIndex = new Map();
 
 const CODE_EXT = ['.js', '.jsx', '.ts', '.tsx', '.py', '.php', '.java', '.c', '.cpp', '.cs', '.go', '.rb', '.swift', '.kt', '.html', '.css'];
 
-module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY }) {
+module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY }) {
 
   app.post('/upload', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file received.' });
@@ -46,21 +47,27 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY }) {
     res.json({ fileId, url: `/files/${path.basename(finalPath)}`, name: req.file.originalname });
   });
 
-  // Pollinations.ai is a genuinely free, keyless image-generation API - no
-  // account, no API key, just a URL. Replaces the old Gemini-based route,
-  // which needed a Google AI Studio key and stopped working.
   app.post('/generate-image', async (req, res) => {
     const { prompt } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
+    if (!GEMINI_API_KEY) {
+      return res.status(501).json({ error: 'Image generation needs GEMINI_API_KEY - Groq has no image-generation model, so this route still relies on Gemini.' });
+    }
     try {
-      const seed = Math.floor(Math.random() * 1_000_000); // avoids Pollinations' CDN caching the same image for repeat prompts
-      const genUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&seed=${seed}`;
-      const response = await fetch(genUrl);
-      if (!response.ok) throw new Error(`Image provider responded ${response.status}`);
-      const arrayBuffer = await response.arrayBuffer();
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_API_KEY}`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }) }
+      );
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Gemini responded ${response.status}: ${errText.slice(0, 200)}`);
+      }
+      const data = await response.json();
+      const imagePart = data?.candidates?.[0]?.content?.parts?.find((p) => p.inlineData);
+      if (!imagePart) throw new Error('Model did not return image data.');
       const fileId = uuid();
       const filePath = path.join(UPLOAD_DIR, `${fileId}.png`);
-      fs.writeFileSync(filePath, Buffer.from(arrayBuffer));
+      fs.writeFileSync(filePath, Buffer.from(imagePart.inlineData.data, 'base64'));
       res.json({ imageUrl: `/files/${fileId}.png`, caption: 'Here\'s what I generated.' });
     } catch (err) {
       res.status(500).json({ error: `Image generation failed: ${err.message}` });
@@ -204,76 +211,6 @@ Exactly ${SCENE_COUNT} items. Each is one concise sentence describing what to SH
     } catch (err) {
       fs.rmSync(jobDir, { recursive: true, force: true });
       res.status(500).json({ error: `Video generation failed: ${err.message}` });
-    }
-  });
-
-  // ---------------- "Take a picture and search" (visual search) ----------------
-  // Two stages: (1) Groq's qwen/qwen3.6-27b vision model looks at the photo
-  // and identifies what it is + writes a short search query for it (runs on
-  // the same GROQ_API_KEY already used for chat - no separate vision key
-  // needed), (2) that query goes to DuckDuckGo's free Instant Answer API
-  // (no key needed) for a quick supporting summary/links, so the reply
-  // isn't just "here's a guess" but has a bit of real lookup behind it too.
-  app.post('/vision-search', async (req, res) => {
-    const { fileId } = req.body;
-    const file = fileIndex.get(fileId);
-    if (!file) return res.status(404).json({ error: 'Unknown fileId - upload the photo first.' });
-    try {
-      const imageBuffer = fs.readFileSync(file.path);
-      const base64Image = imageBuffer.toString('base64');
-      const mimeType = file.mimeType && file.mimeType.startsWith('image/') ? file.mimeType : 'image/jpeg';
-
-      const visionRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${GROQ_API_KEY}` },
-        body: JSON.stringify({
-          model: 'qwen/qwen3.6-27b',
-          response_format: { type: 'json_object' },
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'text', text: `Look closely at this photo. Respond ONLY with JSON (no markdown fences):
-{"subject": "short name of the main thing in the photo", "description": "3-5 sentence detailed description of what it is, covering anything notable", "searchQuery": "a good short web search query to learn more about this specific thing"}` },
-              { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Image}` } }
-            ]
-          }]
-        })
-      });
-      if (!visionRes.ok) {
-        const errText = await visionRes.text();
-        throw new Error(`Vision model responded ${visionRes.status}: ${errText.slice(0, 200)}`);
-      }
-      const visionData = await visionRes.json();
-      const rawText = visionData?.choices?.[0]?.message?.content || '{}';
-      const clean = rawText.replace(/```json|```/g, '').trim();
-      let parsed;
-      try { parsed = JSON.parse(clean); } catch (e) { parsed = { subject: 'Unknown', description: clean, searchQuery: '' }; }
-
-      let webSummary = null;
-      let relatedLinks = [];
-      if (parsed.searchQuery) {
-        try {
-          const ddgRes = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(parsed.searchQuery)}&format=json&no_html=1&skip_disambig=1`);
-          if (ddgRes.ok) {
-            const ddg = await ddgRes.json();
-            webSummary = ddg.AbstractText || null;
-            relatedLinks = (ddg.RelatedTopics || [])
-              .filter((t) => t.Text && t.FirstURL)
-              .slice(0, 4)
-              .map((t) => ({ text: t.Text, url: t.FirstURL }));
-          }
-        } catch (e) { /* web enrichment is best-effort - vision result still stands without it */ }
-      }
-
-      res.json({
-        subject: parsed.subject || 'Unknown',
-        description: parsed.description || '',
-        searchQuery: parsed.searchQuery || '',
-        webSummary,
-        relatedLinks
-      });
-    } catch (err) {
-      res.status(500).json({ error: `Visual search failed: ${err.message}` });
     }
   });
 
