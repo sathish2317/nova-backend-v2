@@ -67,13 +67,144 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY }) {
     }
   });
 
+  // ---------------- Video generation (free, reliable, 2+ minutes) ----------------
+  // Honest technical note: there is no free API anywhere (Hugging Face
+  // included) that generates 2 continuous minutes of true AI motion video -
+  // free video models cap out around 2-4 seconds per generation, and
+  // chaining many of those together is slow, rate-limit-prone, and the
+  // motion doesn't connect between clips anyway.
+  //
+  // What actually works reliably for free: break the topic into scenes,
+  // generate one AI image per scene (Gemini - already used by
+  // /generate-image above), then use ffmpeg to turn each image into a
+  // slow zoom/pan ("Ken Burns") clip and concatenate them into one .mp4
+  // that hits your target length exactly. No third-party video API in the
+  // critical path = nothing there to rate-limit or randomly fail.
+  const ffmpegPath = require('ffmpeg-static');
+  const { execFile } = require('child_process');
+
+  const SCENE_SECONDS = 10;         // length of each still-image clip
+  const TARGET_SECONDS = 130;       // comfortably over the requested 2 min (120s)
+  const SCENE_COUNT = Math.ceil(TARGET_SECONDS / SCENE_SECONDS); // 13 scenes
+  const IMAGE_CONCURRENCY = 3;      // parallel Gemini calls - fast, but under free-tier rate limits
+
+  function runFfmpeg(args) {
+    return new Promise((resolve, reject) => {
+      execFile(ffmpegPath, args, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
+        if (err) reject(new Error(stderr?.slice(-500) || err.message));
+        else resolve();
+      });
+    });
+  }
+
+  // Runs `fn` over `items` with at most `limit` in flight at once - keeps
+  // us comfortably under Gemini's free-tier requests-per-minute limit
+  // instead of firing 13 requests at the same instant.
+  async function mapWithConcurrency(items, limit, fn) {
+    const results = new Array(items.length);
+    let next = 0;
+    async function worker() {
+      while (next < items.length) {
+        const i = next++;
+        results[i] = await fn(items[i], i);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+    return results;
+  }
+
+  // One Gemini image call, with a couple of retries on rate-limit (429)
+  // or transient errors so one flaky call doesn't sink the whole video.
+  async function generateSceneImage(sceneText) {
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_API_KEY}`,
+          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: sceneText }] }] }) }
+        );
+        if (response.status === 429) throw new Error('rate limited');
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Gemini responded ${response.status}: ${errText.slice(0, 150)}`);
+        }
+        const data = await response.json();
+        const imagePart = data?.candidates?.[0]?.content?.parts?.find((p) => p.inlineData);
+        if (!imagePart) throw new Error('Model did not return image data.');
+        return Buffer.from(imagePart.inlineData.data, 'base64');
+      } catch (e) {
+        lastErr = e;
+        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1))); // backoff before retrying
+      }
+    }
+    throw lastErr;
+  }
+
   app.post('/generate-video', async (req, res) => {
     const { prompt } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
-    if (!process.env.VIDEO_GEN_API_KEY) {
-      return res.status(501).json({ error: 'Video generation isn\'t configured yet - there is no free video-generation API to wire up here. Set VIDEO_GEN_API_KEY to a paid provider (e.g. Runway, Luma, Pika) to enable this.' });
+    if (!GEMINI_API_KEY) {
+      return res.status(501).json({ error: 'Video generation needs GEMINI_API_KEY - it generates the scene images the video is built from.' });
     }
-    res.status(501).json({ error: 'Video generation provider not wired up yet.' });
+
+    const jobId = uuid();
+    const jobDir = path.join(UPLOAD_DIR, `video-${jobId}`);
+    fs.mkdirSync(jobDir, { recursive: true });
+
+    try {
+      // 1. Split the topic into SCENE_COUNT short visual scenes.
+      const scenesResult = await askGroqForJSON(
+        GROQ_API_KEY,
+        `Break this into exactly ${SCENE_COUNT} short, visually distinct scenes for a slideshow-style video: "${prompt}".
+Respond ONLY with JSON (no markdown fences): {"scenes": ["scene 1 visual description", "scene 2 visual description", ...]}
+Exactly ${SCENE_COUNT} items. Each is one concise sentence describing what to SHOW, written for an image generator, forming a coherent visual progression from start to end.`
+      );
+      const scenes = Array.isArray(scenesResult.scenes) ? scenesResult.scenes.slice(0, SCENE_COUNT) : [];
+      while (scenes.length < SCENE_COUNT) scenes.push(prompt); // pad if the model returned fewer than asked
+      if (scenes.length === 0) throw new Error('Could not break the prompt into scenes.');
+
+      // 2. Generate one image per scene (a few in parallel at a time).
+      const imageBuffers = await mapWithConcurrency(scenes, IMAGE_CONCURRENCY, generateSceneImage);
+      imageBuffers.forEach((buf, i) => fs.writeFileSync(path.join(jobDir, `scene${i}.png`), buf));
+
+      // 3. Turn each image into a Ken-Burns clip of SCENE_SECONDS length.
+      // Every clip is encoded with identical size/fps/codec so the final
+      // concat step can just copy the streams (fast, and nothing to
+      // mismatch/fail on).
+      const fps = 25;
+      const frames = SCENE_SECONDS * fps;
+      for (let i = 0; i < scenes.length; i++) {
+        const inPath = path.join(jobDir, `scene${i}.png`);
+        const outPath = path.join(jobDir, `clip${i}.mp4`);
+        await runFfmpeg([
+          '-y', '-loop', '1', '-i', inPath,
+          '-vf', `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,zoompan=z='min(zoom+0.0015,1.2)':d=${frames}:s=1280x720:fps=${fps}`,
+          '-t', String(SCENE_SECONDS),
+          '-pix_fmt', 'yuv420p', '-c:v', 'libx264', '-preset', 'veryfast', '-movflags', '+faststart',
+          outPath
+        ]);
+      }
+
+      // 4. Concatenate all clips into the final video.
+      const listPath = path.join(jobDir, 'list.txt');
+      const listContent = scenes.map((_, i) => `file '${path.join(jobDir, `clip${i}.mp4`)}'`).join('\n');
+      fs.writeFileSync(listPath, listContent);
+      const finalId = uuid();
+      const finalPath = path.join(UPLOAD_DIR, `${finalId}.mp4`);
+      await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', finalPath]);
+
+      // Clean up the per-job scratch folder, keep only the final file.
+      fs.rmSync(jobDir, { recursive: true, force: true });
+
+      res.json({
+        videoUrl: `/files/${finalId}.mp4`,
+        durationSeconds: SCENE_COUNT * SCENE_SECONDS,
+        caption: `Here's your ${SCENE_COUNT * SCENE_SECONDS}-second video.`
+      });
+    } catch (err) {
+      fs.rmSync(jobDir, { recursive: true, force: true });
+      res.status(500).json({ error: `Video generation failed: ${err.message}` });
+    }
   });
 
   // ---------------- "Take a picture and search" (visual search) ----------------
@@ -152,18 +283,33 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY }) {
   // .pdf file on disk and hands back a /files/ URL the app can download,
   // same as an image or video.
   app.post('/generate-document', async (req, res) => {
-    const { prompt, format } = req.body;
+    const { prompt, format, revision } = req.body;
     if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt is required.' });
     const fmt = format === 'pdf' ? 'pdf' : 'docx';
 
     try {
-      const structured = await askGroqForJSON(
-        GROQ_API_KEY,
-        `You are a professional document writer. Write the full content for this request: "${prompt}".
+      // `revision` lets the app show a preview first and only write a new
+      // file once the user is happy - see ChatScreen's pendingDocRef. When
+      // present, we hand the PREVIOUS content back to the model along with
+      // the user's correction instead of starting from a blank page, so
+      // "make the second paragraph shorter" actually edits it instead of
+      // regenerating something unrelated.
+      const isRevision = revision && revision.previousContent && typeof revision.instruction === 'string';
+      const structuredPrompt = isRevision
+        ? `You are revising a document you previously wrote. Here is the CURRENT content as JSON:
+${JSON.stringify(revision.previousContent)}
+
+The user's requested change: "${revision.instruction}"
+
+Apply that change and return the FULL updated document (not just the changed part). Keep everything the user didn't ask to change as close to the original as sensible.
+Respond ONLY with JSON in this exact shape (no markdown fences):
+{"title": "Document title", "sections": [{"heading": "Optional heading or empty string", "paragraphs": ["paragraph text", "..."], "bullets": ["optional bullet", "..."]}]}`
+        : `You are a professional document writer. Write the full content for this request: "${prompt}".
 Respond ONLY with JSON in this exact shape (no markdown fences):
 {"title": "Document title", "sections": [{"heading": "Optional heading or empty string", "paragraphs": ["paragraph text", "..."], "bullets": ["optional bullet", "..."]}]}
-Write complete, well-organized, ready-to-use content - not a description of what the document should contain.`
-      );
+Write complete, well-organized, ready-to-use content - not a description of what the document should contain.`;
+
+      const structured = await askGroqForJSON(GROQ_API_KEY, structuredPrompt);
 
       const title = structured.title || 'Document';
       const sections = Array.isArray(structured.sections) ? structured.sections : [];
@@ -218,9 +364,79 @@ Write complete, well-organized, ready-to-use content - not a description of what
         });
       }
 
-      res.json({ documentUrl: url, name: `${title}.${fmt}`, title, format: fmt, caption: `Here's your ${fmt.toUpperCase()} - tap to download.` });
+      res.json({
+        documentUrl: url,
+        name: `${title}.${fmt}`,
+        title,
+        format: fmt,
+        // Sent back so the app can hold onto it and pass it back as
+        // `revision.previousContent` if the user asks for a change.
+        content: { title, sections },
+        caption: isRevision ? `Updated - here's the new version.` : `Here's your ${fmt.toUpperCase()} - review it, then download when you're happy with it.`
+      });
     } catch (err) {
       res.status(500).json({ error: `Document generation failed: ${err.message}` });
+    }
+  });
+
+  // ---------------- Camera "take a picture and search" ----------------
+  // The app has called this route for a while (config.js -> ENDPOINTS.visionSearch)
+  // but it never actually existed on the backend, so every camera-search
+  // request 404'd. Uses Gemini's vision model to identify + describe the
+  // photo, then narrates the result in Tamil as well (subjectTamil /
+  // descriptionTamil) since that's what the app speaks aloud.
+  app.post('/vision-search', async (req, res) => {
+    const { fileId } = req.body;
+    const file = fileIndex.get(fileId);
+    if (!file) return res.status(404).json({ error: 'Unknown fileId - upload the photo first.' });
+    if (!GEMINI_API_KEY) {
+      return res.status(501).json({ error: 'Photo search needs GEMINI_API_KEY configured on the backend - Gemini is the only free vision model wired up here.' });
+    }
+    try {
+      const imageBuffer = fs.readFileSync(file.path);
+      const base64Image = imageBuffer.toString('base64');
+      const mimeType = file.mimeType && file.mimeType.startsWith('image/') ? file.mimeType : 'image/jpeg';
+
+      const visionRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                {
+                  text: 'Identify the main subject of this photo and give a short, factual, helpful description of it - as if researching it for someone who just took the picture. Respond ONLY with JSON (no markdown fences): {"subject": "short name of what it is", "description": "2-4 sentence factual description or interesting facts about it"}'
+                },
+                { inlineData: { mimeType, data: base64Image } }
+              ]
+            }]
+          })
+        }
+      );
+      if (!visionRes.ok) {
+        const errText = await visionRes.text();
+        throw new Error(`Gemini vision responded ${visionRes.status}: ${errText.slice(0, 200)}`);
+      }
+      const visionData = await visionRes.json();
+      const rawText = visionData?.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text || '{}';
+      const clean = rawText.replace(/```json|```/g, '').trim();
+      let parsed;
+      try { parsed = JSON.parse(clean); } catch (e) { parsed = { subject: 'Unknown subject', description: clean.slice(0, 400) || 'Could not analyze this photo.' }; }
+
+      const subject = parsed.subject || 'Unknown subject';
+      const description = parsed.description || 'No description available.';
+
+      // Best-effort Tamil narration - if translation fails for any reason,
+      // fall back to the English text rather than failing the whole request.
+      const [subjectTamil, descriptionTamil] = await Promise.all([
+        translateText(GROQ_API_KEY, subject),
+        translateText(GROQ_API_KEY, description)
+      ]);
+
+      res.json({ subject, description, subjectTamil, descriptionTamil });
+    } catch (err) {
+      res.status(500).json({ error: `Visual search failed: ${err.message}` });
     }
   });
 
@@ -522,6 +738,32 @@ function sampleSourceFiles(files, max, projectDir) {
       return `--- ${f} ---\n${content}`;
     })
     .join('\n\n');
+}
+
+// Small, best-effort translator for Tamil narration on /vision-search.
+// Separate from server.js's translateToTamil (that one isn't exported) -
+// duplicated here on purpose to keep server-additions.js self-contained.
+async function translateText(apiKey, text, targetLang = 'Tamil') {
+  if (!text) return '';
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: `You are a translator. Translate the given text into natural, spoken ${targetLang}. Output ONLY the translation, nothing else.` },
+          { role: 'user', content: text }
+        ],
+        temperature: 0.3
+      })
+    });
+    if (!response.ok) return text;
+    const data = await response.json();
+    return data?.choices?.[0]?.message?.content?.trim() || text;
+  } catch (e) {
+    return text; // fall back to English rather than failing the whole request
+  }
 }
 
 // Groq's chat-completions endpoint is OpenAI-compatible - same shape as
