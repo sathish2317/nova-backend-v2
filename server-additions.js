@@ -71,11 +71,38 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
     res.json({ fileId, url: `/files/${path.basename(finalPath)}`, name: req.file.originalname });
   });
 
+  // ---------------- Image generation ----------------
+  // Now tries Hugging Face's free text-to-image model FIRST (same
+  // HF_IMAGE_MODEL/callHuggingFace used by the video pipeline below - no
+  // new dependency), and only falls back to Gemini if HF is unavailable
+  // and a GEMINI_API_KEY is configured. This used to be Gemini-only, which
+  // is why it broke the moment the Gemini key's project got blocked
+  // (403) - HF and Gemini are unrelated accounts, so one being down
+  // doesn't take out the other anymore.
   app.post('/generate-image', async (req, res) => {
     const { prompt } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
+
+    if (HF_API_KEY) {
+      try {
+        const buffer = await callHuggingFace(HF_IMAGE_MODEL, prompt, { maxAttempts: 3 });
+        if (buffer && buffer.length > 500) {
+          const fileId = uuid();
+          const filePath = path.join(UPLOAD_DIR, `${fileId}.png`);
+          fs.writeFileSync(filePath, buffer);
+          return res.json({ imageUrl: `/files/${fileId}.png`, caption: 'Here\'s what I generated (Hugging Face).' });
+        }
+      } catch (hfErr) {
+        // Falls through to Gemini below instead of failing outright.
+      }
+    }
+
     if (!GEMINI_API_KEY) {
-      return res.status(501).json({ error: 'Image generation needs GEMINI_API_KEY - Groq has no image-generation model, so this route still relies on Gemini.' });
+      return res.status(501).json({
+        error: HF_API_KEY
+          ? 'Image generation failed on Hugging Face and no GEMINI_API_KEY is configured as a fallback.'
+          : 'Image generation needs HF_API_KEY or GEMINI_API_KEY configured on the backend.'
+      });
     }
     try {
       const response = await fetch(
@@ -92,7 +119,7 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
       const fileId = uuid();
       const filePath = path.join(UPLOAD_DIR, `${fileId}.png`);
       fs.writeFileSync(filePath, Buffer.from(imagePart.inlineData.data, 'base64'));
-      res.json({ imageUrl: `/files/${fileId}.png`, caption: 'Here\'s what I generated.' });
+      res.json({ imageUrl: `/files/${fileId}.png`, caption: 'Here\'s what I generated (Gemini).' });
     } catch (err) {
       res.status(500).json({ error: `Image generation failed: ${err.message}` });
     }
