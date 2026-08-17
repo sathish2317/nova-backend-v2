@@ -8,6 +8,7 @@
     "dev": "node server.js"
   },
   "dependencies": {
+    "@huggingface/inference": "^4.13.26",
     "adm-zip": "^0.6.0",
     "cors": "^2.8.5",
     "docx": "^9.0.2",
