@@ -45,7 +45,20 @@ const upload = multer({
 const fileIndex = new Map();
 const projectIndex = new Map();
 
-const CODE_EXT = ['.js', '.jsx', '.ts', '.tsx', '.py', '.php', '.java', '.c', '.cpp', '.cs', '.go', '.rb', '.swift', '.kt', '.html', '.css'];
+// Any file extension the Lab tab should treat as "code" (gets the code-
+// reviewer prompt + is eligible for /codelab/fix-file and /codelab/edit-
+// file) rather than the generic "document" summary path. Kept in sync with
+// AttachmentBar.js's ALLOWED_EXTENSIONS on the app side - this used to be
+// missing most languages (only had ~16 extensions), which is why files
+// like plain .html sometimes fell through to being treated as a generic
+// document instead of getting a proper code review.
+const CODE_EXT = [
+  '.html', '.htm', '.css', '.scss', '.sass', '.less',
+  '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+  '.py', '.php', '.java', '.c', '.h', '.cpp', '.hpp', '.cs', '.go', '.rb', '.swift', '.kt', '.kts',
+  '.rs', '.dart', '.sh', '.bat', '.ps1', '.pl', '.lua', '.r', '.scala', '.vue', '.svelte',
+  '.json', '.xml', '.yml', '.yaml', '.sql', '.md'
+];
 
 module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY }) {
 
@@ -748,12 +761,66 @@ Original file (${file.name}):\n\n${text.slice(0, 12000)}`;
         const finalPath = path.join(UPLOAD_DIR, `${outId}${outExt}`);
         fs.writeFileSync(finalPath, f.content || '', 'utf8');
         fileIndex.set(outId, { path: finalPath, name: outName, mimeType: 'text/plain' });
-        return { name: outName, language: f.language || 'unknown', url: `/files/${path.basename(finalPath)}`, fileId: outId };
+        // `content` is echoed back (not just the download url) so the app
+        // can show an in-app code preview before the user downloads it.
+        return { name: outName, language: f.language || 'unknown', url: `/files/${path.basename(finalPath)}`, fileId: outId, content: f.content || '' };
       });
 
       res.json({ fixSummary: result.fixSummary || 'Fixed.', files: written });
     } catch (err) {
       res.status(500).json({ error: `Fix failed: ${err.message}` });
+    }
+  });
+
+  // ---------------- Prompt-driven single-file edit ----------------
+  // Like /codelab/fix-file, but instead of "fix every bug", the change is
+  // whatever free-text instruction the user typed (e.g. "make the button
+  // blue", "add a loading spinner", "remove the console.logs"). Reuses the
+  // same split-by-language behavior and response shape as fix-file so the
+  // app's preview/download UI works identically for both.
+  app.post('/codelab/edit-file', async (req, res) => {
+    const { fileId, instruction } = req.body;
+    const file = fileIndex.get(fileId);
+    if (!file) return res.status(404).json({ error: 'Unknown fileId - analyze the file first.' });
+    if (!instruction || !instruction.trim()) return res.status(400).json({ error: 'instruction is required.' });
+    try {
+      const ext = path.extname(file.name).toLowerCase();
+      const mime = file.mimeType || '';
+      const text = await extractTextFromFile(file, ext, mime);
+      const editable = CODE_EXT.includes(ext) || ext === '' || ext === '.txt';
+      if (text === null || !editable) {
+        return res.status(400).json({ error: 'Only code/text files can be edited this way - this file type isn\'t supported.' });
+      }
+
+      const baseName = path.basename(file.name, ext) || 'edited';
+      const prompt = `You are a senior software engineer editing a file for someone. Apply ONLY this requested change (their wording may contain typos - infer their real intent): "${instruction.trim()}"
+
+Keep everything else in the file exactly as it is - do not fix unrelated issues, do not rewrite working code, do not change formatting/style outside what the instruction requires. Make the smallest correct change that satisfies the request.
+
+If this single file actually bundles more than one language together (for example a .html file with a large inline <style> block and/or <script> block), split your result into SEPARATE files - one per language (e.g. "${baseName}.html", "${baseName}.css", "${baseName}.js"). Otherwise, just return the one file with the same name.
+
+Respond ONLY with JSON, no markdown fences:
+{"fixSummary": "1-3 sentence description of exactly what you changed", "files": [{"filename": "${file.name}", "language": "...", "content": "the complete updated file content"}]}
+
+Current file (${file.name}):\n\n${text.slice(0, 12000)}`;
+
+      const result = await askGroqForJSON(GROQ_API_KEY, prompt, 0.2);
+      const outFiles = Array.isArray(result.files) ? result.files : [];
+      if (outFiles.length === 0) throw new Error('The model did not return any updated file content.');
+
+      const written = outFiles.map((f) => {
+        const outName = f.filename || file.name;
+        const outId = uuid();
+        const outExt = path.extname(outName) || ext || '.txt';
+        const finalPath = path.join(UPLOAD_DIR, `${outId}${outExt}`);
+        fs.writeFileSync(finalPath, f.content || '', 'utf8');
+        fileIndex.set(outId, { path: finalPath, name: outName, mimeType: 'text/plain' });
+        return { name: outName, language: f.language || 'unknown', url: `/files/${path.basename(finalPath)}`, fileId: outId, content: f.content || '' };
+      });
+
+      res.json({ fixSummary: result.fixSummary || 'Updated.', files: written });
+    } catch (err) {
+      res.status(500).json({ error: `Edit failed: ${err.message}` });
     }
   });
 
