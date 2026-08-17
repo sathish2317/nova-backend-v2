@@ -149,7 +149,18 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
   const IMAGE_CONCURRENCY = 2;      // parallel HF calls - free tier is easily rate-limited, keep this low
 
   const HF_VIDEO_MODEL = 'damo-vilab/text-to-video-ms-1.7b';
-  const HF_IMAGE_MODEL = 'stabilityai/stable-diffusion-2-1';
+  // stable-diffusion-2-1 used to work here but Hugging Face has since
+  // narrowed what the free "hf-inference" provider actually serves - as of
+  // 2025 it's mostly lightweight CPU tasks (embeddings, classification,
+  // small text models), and older/heavier diffusion checkpoints like this
+  // one were dropped from it entirely, which is why every call was coming
+  // back "Model not supported by provider hf-inference" (a 400, not a
+  // loading/rate-limit response, so it wasn't something retries could fix).
+  // stable-diffusion-3-medium-diffusers is what HF's own current docs list
+  // as a live hf-inference example, so scene images (and therefore both
+  // /generate-image and the video slideshow fallback, which both call this
+  // model) actually work again.
+  const HF_IMAGE_MODEL = 'stabilityai/stable-diffusion-3-medium-diffusers';
   // Hugging Face fully decommissioned the old api-inference.huggingface.co
   // "Serverless Inference API" host - it now returns 410/refuses to
   // resolve. Every call has to go through the new Inference Providers
