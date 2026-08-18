@@ -19,7 +19,9 @@ const PORT = process.env.PORT || 3000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GEMINI_API_KEY =process.env.GEMINI_API_KEY; // optional - only /generate-image and /vision-search need this
 const HF_API_KEY = process.env.HF_API_KEY; // optional - only /generate-video needs this (free, no Gemini)
-const GROQ_MODEL = 'openai/gpt-oss-20b';
+// Groq retired llama-3.3-70b-versatile on Aug 16, 2026. Using their
+// recommended replacement - same "everyday chat" tier, faster inference.
+const GROQ_MODEL = 'openai/gpt-oss-120b';
 
 if (!GROQ_API_KEY) {
   console.error('ERROR: GROQ_API_KEY is missing. Add it in your .env file (local) or Render environment variables (deployed).');
