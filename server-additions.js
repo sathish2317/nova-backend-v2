@@ -90,7 +90,17 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
           const fileId = uuid();
           const filePath = path.join(UPLOAD_DIR, `${fileId}.png`);
           fs.writeFileSync(filePath, buffer);
-          return res.json({ imageUrl: `/files/${fileId}.png`, caption: 'Here\'s what I generated (Hugging Face).' });
+          // Render's disk is wiped on every restart/redeploy (free tier
+          // sleeps after ~15 min idle), so /files/<id>.png can 404 later
+          // even though generation succeeded. Sending the bytes back as
+          // base64 right now means the app can save the image straight
+          // to the phone without ever depending on that file still being
+          // there - imageUrl is kept only for the inline chat preview.
+          return res.json({
+            imageUrl: `/files/${fileId}.png`,
+            imageBase64: `data:image/png;base64,${buffer.toString('base64')}`,
+            caption: 'Here\'s what I generated (Hugging Face).'
+          });
         }
       } catch (hfErr) {
         // Falls through to Gemini below instead of failing outright.
@@ -119,7 +129,11 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
       const fileId = uuid();
       const filePath = path.join(UPLOAD_DIR, `${fileId}.png`);
       fs.writeFileSync(filePath, Buffer.from(imagePart.inlineData.data, 'base64'));
-      res.json({ imageUrl: `/files/${fileId}.png`, caption: 'Here\'s what I generated (Gemini).' });
+      res.json({
+        imageUrl: `/files/${fileId}.png`,
+        imageBase64: `data:image/png;base64,${imagePart.inlineData.data}`,
+        caption: 'Here\'s what I generated (Gemini).'
+      });
     } catch (err) {
       res.status(500).json({ error: `Image generation failed: ${err.message}` });
     }
@@ -1070,7 +1084,7 @@ async function translateText(apiKey, text, targetLang = 'Tamil') {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: 'openai/gpt-oss-120b',
         messages: [
           { role: 'system', content: `You are a translator. Translate the given text into natural, spoken ${targetLang}. Output ONLY the translation, nothing else.` },
           { role: 'user', content: text }
@@ -1097,7 +1111,7 @@ async function askGroqForJSON(apiKey, prompt, temperature = 0.3) {
       'Authorization': `Bearer ${apiKey}`
     },
     body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
+      model: 'openai/gpt-oss-120b',
       messages: [{ role: 'user', content: prompt }],
       response_format: { type: 'json_object' },
       temperature
