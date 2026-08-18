@@ -699,32 +699,66 @@ Content:\n\n${excerpt}`
       }
 
       const isCode = CODE_EXT.includes(ext);
-      const trimmed = text.slice(0, 8000);
+      const CHAR_LIMIT = 20000; // ~5-6k tokens - covers most real source files whole, not just the first screen of one
+      const wasTruncated = text.length > CHAR_LIMIT;
+      const trimmed = text.slice(0, CHAR_LIMIT);
       const lineCount = text.split('\n').length;
 
       const prompt = isCode
-        ? `You are a senior code reviewer. Review this single ${ext} file (${lineCount} lines). Respond ONLY with JSON:
-{"language": "detected language", "summary": "2-3 sentence summary of what this file does", "issues": [{"title": "...", "severity": "critical|high|medium|low", "line": 0, "explanation": "..."}]}
-File content:\n\n${trimmed}`
+        ? buildCodeReviewPrompt(file.name, ext, trimmed, lineCount, wasTruncated)
         : `Summarize this document (${file.name}, ${lineCount} lines/paragraphs of extracted text). Respond ONLY with JSON:
 {"summary": "3-5 sentence summary of the document's content and purpose", "notableFindings": ["short finding", "..."]}
 Extracted text:\n\n${trimmed}`;
 
-      const result = await askGroqForJSON(GROQ_API_KEY, prompt);
+      const result = await askGroqForJSON(GROQ_API_KEY, prompt, isCode ? 0.2 : 0.3, isCode ? 8000 : undefined);
+
+      if (isCode) {
+        // confirmedErrors (rich, per-line) map onto the existing `issues`
+        // shape the app already renders - explanation packs problem/
+        // cause/fix into one readable block so CodeLabScreen.js doesn't
+        // need a layout change to show them.
+        const issues = (result.confirmedErrors || []).map((e) => ({
+          title: e.title,
+          severity: e.severity,
+          line: e.line,
+          explanation: [
+            e.problem,
+            e.cause ? `Why: ${e.cause}` : null,
+            e.badCode ? `Current:\n${e.badCode}` : null,
+            e.fixedCode ? `Fix:\n${e.fixedCode}` : null
+          ].filter(Boolean).join('\n\n')
+        }));
+
+        return res.json({
+          kind: 'code-file',
+          fileId,
+          name: file.name,
+          mimeType: mime,
+          lineCount,
+          language: result.language || 'unknown',
+          framework: result.framework || '',
+          overallStatus: result.overallStatus || 'ok',
+          summary: result.summary || 'No summary available.',
+          issues,
+          potentialProblems: result.potentialProblems || [],
+          improvements: result.improvements || [],
+          correctedFile: result.correctedFile || '',
+          requiredCommands: result.requiredCommands || [],
+          fixable: true
+        });
+      }
 
       res.json({
-        kind: isCode ? 'code-file' : 'document',
+        kind: 'document',
         fileId,
         name: file.name,
         mimeType: mime,
         lineCount,
-        language: result.language || (isCode ? 'unknown' : 'N/A'),
+        language: 'N/A',
         summary: result.summary || 'No summary available.',
-        issues: result.issues || [],
+        issues: [],
         notableFindings: result.notableFindings || [],
-        // Only code/text files can be sent through /codelab/fix-file - lets
-        // the app decide whether to show the "Fix entire file with AI" button.
-        fixable: isCode
+        fixable: false
       });
     } catch (err) {
       res.status(500).json({ error: `File analysis failed: ${err.message}` });
@@ -748,13 +782,25 @@ Extracted text:\n\n${trimmed}`;
 
       const ext = path.extname(safeName).toLowerCase();
       const isCode = CODE_EXT.includes(ext) || !ext;
-      const trimmed = content.slice(0, 8000);
+      const CHAR_LIMIT = 20000;
+      const wasTruncated = content.length > CHAR_LIMIT;
+      const trimmed = content.slice(0, CHAR_LIMIT);
       const lineCount = content.split('\n').length;
 
-      const prompt = `You are a senior code reviewer. Review this pasted ${ext || 'code'} snippet (${lineCount} lines). Respond ONLY with JSON:
-{"language": "detected language", "summary": "2-3 sentence summary of what this code does", "issues": [{"title": "...", "severity": "critical|high|medium|low", "line": 0, "explanation": "..."}]}
-Code:\n\n${trimmed}`;
-      const result = await askGroqForJSON(GROQ_API_KEY, prompt);
+      const prompt = buildCodeReviewPrompt(safeName, ext || '.txt', trimmed, lineCount, wasTruncated);
+      const result = await askGroqForJSON(GROQ_API_KEY, prompt, 0.2, 8000);
+
+      const issues = (result.confirmedErrors || []).map((e) => ({
+        title: e.title,
+        severity: e.severity,
+        line: e.line,
+        explanation: [
+          e.problem,
+          e.cause ? `Why: ${e.cause}` : null,
+          e.badCode ? `Current:\n${e.badCode}` : null,
+          e.fixedCode ? `Fix:\n${e.fixedCode}` : null
+        ].filter(Boolean).join('\n\n')
+      }));
 
       res.json({
         kind: 'code-file',
@@ -762,8 +808,14 @@ Code:\n\n${trimmed}`;
         name: safeName,
         lineCount,
         language: result.language || 'unknown',
+        framework: result.framework || '',
+        overallStatus: result.overallStatus || 'ok',
         summary: result.summary || 'No summary available.',
-        issues: result.issues || [],
+        issues,
+        potentialProblems: result.potentialProblems || [],
+        improvements: result.improvements || [],
+        correctedFile: result.correctedFile || '',
+        requiredCommands: result.requiredCommands || [],
         fixable: true
       });
     } catch (err) {
@@ -1103,7 +1155,7 @@ async function translateText(apiKey, text, targetLang = 'Tamil') {
 // Groq's chat-completions endpoint is OpenAI-compatible - same shape as
 // the OpenAI SDK, just a different base URL. json_object mode plus the
 // "respond ONLY with JSON" prompts keep output parseable.
-async function askGroqForJSON(apiKey, prompt, temperature = 0.3) {
+async function askGroqForJSON(apiKey, prompt, temperature = 0.3, maxTokens) {
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -1114,7 +1166,8 @@ async function askGroqForJSON(apiKey, prompt, temperature = 0.3) {
       model: 'openai/gpt-oss-120b',
       messages: [{ role: 'user', content: prompt }],
       response_format: { type: 'json_object' },
-      temperature
+      temperature,
+      ...(maxTokens ? { max_tokens: maxTokens } : {})
     })
   });
   const data = await response.json();
@@ -1122,4 +1175,59 @@ async function askGroqForJSON(apiKey, prompt, temperature = 0.3) {
   const text = data?.choices?.[0]?.message?.content || '{}';
   const clean = text.replace(/```json|```/g, '').trim();
   return JSON.parse(clean);
+}
+
+// ---------------- Nova AI Code File Analyzer (spec-driven) ----------------
+// Builds the review prompt used by /codelab/analyze-file and
+// /codelab/analyze-text. Kept as one shared function so both routes stay
+// in sync - this is the "Nova AI — Code File Analyzer" behaviour: detect
+// language/framework, walk the WHOLE file (not just the first few lines),
+// separate confirmed errors from potential problems and improvements,
+// give each confirmed error's exact line + why it happens + a corrected
+// snippet, then a full corrected file where practical, with the smallest
+// reliable changes rather than a rewrite.
+function buildCodeReviewPrompt(fileName, ext, trimmed, lineCount, wasTruncated) {
+  return `You are Nova AI, an advanced programming code analysis and debugging assistant. Analyze the ENTIRE file below (not just the first few lines) and respond ONLY with a JSON object, no other text.
+
+File: ${fileName}
+Extension: ${ext || '(none)'}
+Line count: ${lineCount}${wasTruncated ? ' (content was truncated below - only analyze what is shown, do not invent lines past it)' : ''}
+
+Rules:
+- Identify the language, and framework/library/runtime if detectable (e.g. Node.js/Express, React Native/Expo, Laravel, plain PHP). Do not guess the language if the extension and code contradict each other - say so in "summary" instead.
+- Only report a "confirmedErrors" entry when there is real evidence in the code (syntax errors, undefined variables/functions, missing imports, incorrect API/framework usage, deprecated methods, broken paths/URLs, missing error handling, null/undefined bugs, async/await/promise mistakes, security issues, etc). Do not invent errors and do not flag normal style preferences as errors.
+- Put things that MIGHT be a problem but aren't certain into "potentialProblems" instead of "confirmedErrors".
+- Put non-bug suggestions (naming, structure, performance, maintainability) into "improvements" - never mix these into confirmedErrors.
+- For every confirmedErrors entry, give the exact (or closest approximate) line number, the problematic code, what is wrong, why it happens (explained simply, no unnecessary jargon), and a corrected code snippet.
+- Classify every confirmedErrors entry's severity as exactly one of: "critical" (app may fail to start / major feature broken), "high" (a significant feature may not work), "medium" (works but buggy/unreliable), "low" (minor/cosmetic).
+- If you find a hardcoded secret (API key, password, token), do NOT reproduce the real value anywhere in your response - mask it like "GROQ_API_KEY=********" and tell the user to move it to an environment variable.
+- Make the smallest reliable fix - do not rewrite unrelated working code. If a full corrected file is practical given the size shown, provide it in "correctedFile"; otherwise leave "correctedFile" empty and rely on each error's own corrected snippet.
+- If the file needs an npm/pip/composer package that isn't already implied as installed, list the exact install command in "requiredCommands".
+
+Respond with exactly this JSON shape:
+{
+  "language": "detected language",
+  "framework": "detected framework/library, or empty string if none",
+  "overallStatus": "broken" | "needs-fixes" | "minor-issues" | "ok",
+  "summary": "2-4 sentence summary of what this file does and its overall condition",
+  "confirmedErrors": [
+    {
+      "title": "short error name",
+      "severity": "critical" | "high" | "medium" | "low",
+      "line": 0,
+      "problem": "what is wrong",
+      "cause": "why it happens, explained simply",
+      "badCode": "the problematic code",
+      "fixedCode": "the corrected code for just this spot"
+    }
+  ],
+  "potentialProblems": ["short description", "..."],
+  "improvements": ["short suggestion", "..."],
+  "correctedFile": "full corrected file content, or empty string if not practical/needed",
+  "requiredCommands": ["npm install example-package", "..."]
+}
+
+File content:
+
+${trimmed}`;
 }
