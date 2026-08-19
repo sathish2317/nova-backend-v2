@@ -19,6 +19,11 @@ const PORT = process.env.PORT || 3000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GEMINI_API_KEY =process.env.GEMINI_API_KEY; // optional - only /generate-image and /vision-search need this
 const HF_API_KEY = process.env.HF_API_KEY; // optional - only /generate-video needs this (free, no Gemini)
+// Optional - Nova 3D Studio's /generate-3d-model provider seam. Leave
+// both unset (the default) and that route just tells the app to use its
+// free built-in template library instead - see server-additions.js.
+const THREE_D_API_URL = process.env.THREE_D_API_URL;
+const THREE_D_API_KEY = process.env.THREE_D_API_KEY;
 // Groq retired llama-3.3-70b-versatile on Aug 16, 2026. Using their
 // recommended replacement - same "everyday chat" tier, faster inference.
 const GROQ_MODEL = 'openai/gpt-oss-120b';
@@ -361,7 +366,7 @@ app.get('/news', async (req, res) => {
 // Registers /upload, /generate-image, /generate-video, /codelab/* on top
 // of this app. This line was missing before - the routes were defined in
 // server-additions.js but never actually attached to `app`.
-registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY });
+registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY, THREE_D_API_URL, THREE_D_API_KEY });
 
 app.listen(PORT, () => {
   console.log(`Nova backend listening on port ${PORT}`);

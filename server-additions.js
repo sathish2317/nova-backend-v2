@@ -60,7 +60,7 @@ const CODE_EXT = [
   '.json', '.xml', '.yml', '.yaml', '.sql', '.md'
 ];
 
-module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY }) {
+module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY, THREE_D_API_URL, THREE_D_API_KEY }) {
 
   app.post('/upload', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file received.' });
@@ -136,6 +136,76 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
       });
     } catch (err) {
       res.status(500).json({ error: `Image generation failed: ${err.message}` });
+    }
+  });
+
+  // ---------------- 3D model generation (Nova 3D Studio - pluggable) ----------------
+  // There is no free, reliable, no-signup 3D-generation API today the way
+  // there is for images/video - real text-to-3D services (Meshy, Tripo,
+  // Rodin, etc.) require a paid/keyed account. Rather than fake it or
+  // silently fail, this route is a clean, replaceable seam: with
+  // THREE_D_API_URL/THREE_D_API_KEY unset (the default), it always
+  // returns `success: false` with an honest reason, and the app
+  // (utils/studioProvider.js) falls back to its free, offline, built-in
+  // template library instead - never claiming unlimited free generation
+  // that doesn't exist. Add a provider later by setting those two env
+  // vars; no app-side code changes needed.
+  app.post('/generate-3d-model', async (req, res) => {
+    const { prompt } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
+
+    if (!THREE_D_API_URL) {
+      return res.json({
+        success: false,
+        reason: 'not_configured',
+        message: "3D generation isn't connected on this backend yet - Nova will use its built-in template library instead."
+      });
+    }
+
+    try {
+      const response = await fetch(THREE_D_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(THREE_D_API_KEY ? { Authorization: `Bearer ${THREE_D_API_KEY}` } : {})
+        },
+        body: JSON.stringify({ prompt })
+      });
+      const data = await response.json();
+      if (!response.ok || !data?.modelUrl) {
+        return res.json({ success: false, reason: 'provider_error', message: 'The 3D generation provider could not produce a model for that prompt.' });
+      }
+      res.json({ success: true, modelUrl: data.modelUrl, format: data.format || 'glb' });
+    } catch (err) {
+      res.json({ success: false, reason: 'provider_unreachable', message: `3D generation provider error: ${err.message}` });
+    }
+  });
+
+  // ---------------- Nova command parsing for 3D Studio edits ----------------
+  // Only called by the app when its on-device regex parser
+  // (utils/studioCommands.js -> parseLocalEditCommand) couldn't make
+  // sense of the phrasing - ordinary edits like "make the body red"
+  // never reach here at all, keeping Groq usage (and this rate limit)
+  // low. Returns STRUCTURED JSON ACTIONS ONLY, from a fixed whitelist -
+  // never executable code - and the app re-validates every action
+  // against the model's real part names before running anything
+  // (utils/studioCommands.js -> validateActions).
+  app.post('/studio/parse-command', async (req, res) => {
+    const { text, parts } = req.body;
+    if (!text) return res.status(400).json({ error: 'text is required.' });
+    const partList = Array.isArray(parts) ? parts : [];
+
+    const prompt = `You control a simple 3D editor for Nova, a voice assistant. The user said: "${text}"
+The current 3D model has ONLY these named parts: ${JSON.stringify(partList)}.
+Convert the request into a JSON object: {"actions": [...], "reply": "short natural reply"}.
+Each action must be one of: {"action":"color","target":"<part name from the list, or 'everything'>","value":"#rrggbb"} or {"action":"material","target":"<part name from the list, or 'everything'>","value":"matte|glossy|metallic|glass|plastic|emissive"} or {"action":"select","target":"<part name>"} or {"action":"reset"} or {"action":"undo"} or {"action":"redo"}.
+Only use part names from the list above - if the user asks for a part that is not in the list, omit that action and mention it's unavailable in "reply". Respond with ONLY the JSON object.`;
+
+    try {
+      const result = await askGroqForJSON(GROQ_API_KEY, prompt, 0.2);
+      res.json({ actions: Array.isArray(result.actions) ? result.actions : [], reply: result.reply || null });
+    } catch (err) {
+      res.status(500).json({ actions: [], reply: null, error: `Command parsing failed: ${err.message}` });
     }
   });
 
