@@ -41,20 +41,7 @@ if (!HF_API_KEY) {
   console.warn('WARNING: HF_API_KEY is missing. /generate-video will return a "not configured" error until you add a free token from huggingface.co/settings/tokens.');
 }
 
-const corsOptions = {
-  origin: [
-    'http://localhost:8081',
-    'http://localhost:19006',
-    'http://localhost:3000'
-  ],
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: false
-};
-
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
-
+app.use(cors());
 app.use(express.json());
 
 // Serves uploaded files AND generated images back to the app, e.g.
