@@ -16,9 +16,6 @@ const registerNovaLabRoutes = require('./server-additions');
 app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Nova backend listening on port ${PORT}`);
-});
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GEMINI_API_KEY =process.env.GEMINI_API_KEY; // optional - only /generate-image and /vision-search need this
 const HF_API_KEY = process.env.HF_API_KEY; // optional - only /generate-video needs this (free, no Gemini)
