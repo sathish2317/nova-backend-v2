@@ -88,6 +88,8 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
     const { prompt } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
 
+    let hfError = null;
+
     if (HF_API_KEY) {
       try {
         const buffer = await callHuggingFace(HF_IMAGE_MODEL, prompt, { maxAttempts: 3 });
@@ -107,15 +109,22 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
             caption: 'Here\'s what I generated (Hugging Face).'
           });
         }
+        hfError = 'Hugging Face returned an unusably small/empty response.';
       } catch (hfErr) {
-        // Falls through to Gemini below instead of failing outright.
+        // Previously swallowed silently, which made it impossible to tell
+        // WHY every request was falling through to Gemini. Now logged to
+        // the server console (visible in Render's Logs tab) and carried
+        // forward so the final error message (if Gemini also fails) is
+        // actually informative instead of just Gemini's raw text.
+        hfError = hfErr.message;
+        console.error('[generate-image] Hugging Face failed:', hfErr.message);
       }
     }
 
     if (!GEMINI_API_KEY) {
       return res.status(501).json({
         error: HF_API_KEY
-          ? 'Image generation failed on Hugging Face and no GEMINI_API_KEY is configured as a fallback.'
+          ? `Image generation failed on Hugging Face (${hfError}) and no GEMINI_API_KEY is configured as a fallback.`
           : 'Image generation needs HF_API_KEY or GEMINI_API_KEY configured on the backend.'
       });
     }
@@ -126,6 +135,17 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
       );
       if (!response.ok) {
         const errText = await response.text();
+        // 429 on this endpoint is almost always Google's free-tier image
+        // quota being 0 (in effect since Dec 2025) rather than a burst
+        // rate limit - give an actionable message instead of dumping
+        // Google's raw JSON at the user.
+        if (response.status === 429) {
+          throw new Error(
+            'Gemini image generation quota exceeded. Google\'s free API tier allows 0 images per minute - ' +
+            'billing must be enabled on the Google Cloud project tied to this GEMINI_API_KEY (Google Cloud Console ' +
+            '\u2192 link a billing account; Tier 1 needs no minimum spend). Allow 15-30 min after enabling for it to take effect.'
+          );
+        }
         throw new Error(`Gemini responded ${response.status}: ${errText.slice(0, 200)}`);
       }
       const data = await response.json();
