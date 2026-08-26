@@ -79,6 +79,11 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
   // is why it broke the moment the Gemini key's project got blocked
   // (403) - HF and Gemini are unrelated accounts, so one being down
   // doesn't take out the other anymore.
+  //
+  // Gemini fallback uses gemini-3.1-flash-image ("Nano Banana 2") - the
+  // 2.5 Flash Image generation the earlier the model this replaced is
+  // being deprecated, and 3.1-flash-image is the current versatile
+  // generalist image model (4K generation, better text rendering).
   app.post('/generate-image', async (req, res) => {
     const { prompt } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
@@ -116,7 +121,7 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
     }
     try {
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_API_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image:generateContent?key=${GEMINI_API_KEY}`,
         { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }) }
       );
       if (!response.ok) {
@@ -530,7 +535,8 @@ Write complete, well-organized, ready-to-use content - not a description of what
   // ---------------- Camera "take a picture and search" ----------------
   // The app has called this route for a while (config.js -> ENDPOINTS.visionSearch)
   // but it never actually existed on the backend, so every camera-search
-  // request 404'd. Uses Gemini's vision model to identify + describe the
+  // request 404'd. Uses Gemini's vision model (gemini-3.7-flash, Google's
+  // current GA workhorse multimodal model) to identify + describe the
   // photo, then narrates the result in Tamil as well (subjectTamil /
   // descriptionTamil) since that's what the app speaks aloud.
   app.post('/vision-search', async (req, res) => {
@@ -546,7 +552,7 @@ Write complete, well-organized, ready-to-use content - not a description of what
       const mimeType = file.mimeType && file.mimeType.startsWith('image/') ? file.mimeType : 'image/jpeg';
 
       const visionRes = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent?key=${GEMINI_API_KEY}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -589,7 +595,7 @@ Write complete, well-organized, ready-to-use content - not a description of what
       let sources = [];
       try {
         const groundedRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent?key=${GEMINI_API_KEY}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
