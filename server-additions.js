@@ -72,21 +72,64 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
   });
 
   // ---------------- Image generation ----------------
-  // Now tries Hugging Face's free text-to-image model FIRST (same
-  // HF_IMAGE_MODEL/callHuggingFace used by the video pipeline below - no
-  // new dependency), and only falls back to Gemini if HF is unavailable
-  // and a GEMINI_API_KEY is configured. This used to be Gemini-only, which
-  // is why it broke the moment the Gemini key's project got blocked
-  // (403) - HF and Gemini are unrelated accounts, so one being down
-  // doesn't take out the other anymore.
+  // Three-tier fallback, cheapest/most-reliable-for-free first:
+  //  1. Pollinations.ai - no API key, no signup, no billing, no monthly
+  //     credit limit. Community-run (no uptime SLA), so it's tried first
+  //     but never relied on exclusively.
+  //  2. Hugging Face's free text-to-image model (needs HF_API_KEY, and
+  //     free accounts only get <$0.10/month in Inference Providers
+  //     credits, so this runs dry fast under real usage).
+  //  3. Gemini (needs GEMINI_API_KEY + billing enabled on the Google
+  //     Cloud project - free tier gives 0 images/min as of Dec 2025).
+  // Each tier logs its own failure reason instead of swallowing it, so
+  // Render's Logs tab always shows exactly which tier failed and why.
   //
   // Gemini fallback uses gemini-3.1-flash-image ("Nano Banana 2") - the
   // 2.5 Flash Image generation the earlier the model this replaced is
   // being deprecated, and 3.1-flash-image is the current versatile
   // generalist image model (4K generation, better text rendering).
+  const POLLINATIONS_BASE = 'https://image.pollinations.ai/prompt';
+
+  // No key, no auth header - just a GET request that returns image bytes
+  // directly. Returns null (never throws) so the caller can fall through
+  // to HF/Gemini cleanly on any failure.
+  async function tryPollinations(prompt) {
+    try {
+      const url = `${POLLINATIONS_BASE}/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&model=flux`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        console.error(`[generate-image] Pollinations failed: HTTP ${response.status}`);
+        return null;
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      if (buffer.length < 500) {
+        console.error('[generate-image] Pollinations returned an unusably small response.');
+        return null;
+      }
+      return buffer;
+    } catch (err) {
+      console.error('[generate-image] Pollinations failed:', err.message);
+      return null;
+    }
+  }
+
   app.post('/generate-image', async (req, res) => {
     const { prompt } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
+
+    // 1. Pollinations.ai first - completely free, no key, no quota.
+    const pollinationsBuffer = await tryPollinations(prompt);
+    if (pollinationsBuffer) {
+      const fileId = uuid();
+      const filePath = path.join(UPLOAD_DIR, `${fileId}.png`);
+      fs.writeFileSync(filePath, pollinationsBuffer);
+      return res.json({
+        imageUrl: `/files/${fileId}.png`,
+        imageBase64: `data:image/png;base64,${pollinationsBuffer.toString('base64')}`,
+        caption: 'Here\'s what I generated (Pollinations).'
+      });
+    }
 
     let hfError = null;
 
