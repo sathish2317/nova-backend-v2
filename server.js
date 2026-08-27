@@ -24,6 +24,11 @@ const HF_API_KEY = process.env.HF_API_KEY; // optional - only /generate-video ne
 // free built-in template library instead - see server-additions.js.
 const THREE_D_API_URL = process.env.THREE_D_API_URL;
 const THREE_D_API_KEY = process.env.THREE_D_API_KEY;
+// Pollinations 3D (gen.pollinations.ai/3d/...) - real GLB generation.
+// Optional: anonymous requests work on Pollinations' free tier with a
+// lower rate limit; set POLLINATIONS_API_KEY (sk_... from
+// enter.pollinations.ai) to raise it. Never required for the route to work.
+const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY;
 // Groq retired llama-3.3-70b-versatile on Aug 16, 2026. Using their
 // recommended replacement - same "everyday chat" tier, faster inference.
 const GROQ_MODEL = 'openai/gpt-oss-120b';
@@ -366,7 +371,7 @@ app.get('/news', async (req, res) => {
 // Registers /upload, /generate-image, /generate-video, /codelab/* on top
 // of this app. This line was missing before - the routes were defined in
 // server-additions.js but never actually attached to `app`.
-registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY, THREE_D_API_URL, THREE_D_API_KEY });
+registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY, THREE_D_API_URL, THREE_D_API_KEY, POLLINATIONS_API_KEY });
 
 app.listen(PORT, () => {
   console.log(`Nova backend listening on port ${PORT}`);
