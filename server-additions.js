@@ -31,6 +31,7 @@ const PDFDocument = require('pdfkit');
 // Tamil voice sounded robotic before - expo-speech can only ever use
 // whatever voices are already installed on the device.
 const { EdgeTTS } = require('node-edge-tts');
+const { generate3DModel } = require('./services/pollinations3D');
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const PROJECT_DIR = path.join(__dirname, 'projects');
@@ -60,7 +61,7 @@ const CODE_EXT = [
   '.json', '.xml', '.yml', '.yaml', '.sql', '.md'
 ];
 
-module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY, THREE_D_API_URL, THREE_D_API_KEY }) {
+module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY, THREE_D_API_URL, THREE_D_API_KEY, POLLINATIONS_API_KEY }) {
 
   app.post('/upload', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file received.' });
@@ -207,45 +208,87 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
     }
   });
 
-  // ---------------- 3D model generation (Nova 3D Studio - pluggable) ----------------
-  // There is no free, reliable, no-signup 3D-generation API today the way
-  // there is for images/video - real text-to-3D services (Meshy, Tripo,
-  // Rodin, etc.) require a paid/keyed account. Rather than fake it or
-  // silently fail, this route is a clean, replaceable seam: with
-  // THREE_D_API_URL/THREE_D_API_KEY unset (the default), it always
-  // returns `success: false` with an honest reason, and the app
-  // (utils/studioProvider.js) falls back to its free, offline, built-in
-  // template library instead - never claiming unlimited free generation
-  // that doesn't exist. Add a provider later by setting those two env
-  // vars; no app-side code changes needed.
+  // ---------------- 3D model generation (real GLB via Pollinations) ----------------
+  // Real pipeline, no fake/local mesh:
+  //   1. If the caller didn't pass a reference image, generate one with the
+  //      same Pollinations image path /generate-image already uses.
+  //   2. Send that image (or the bare prompt as a fallback) to
+  //      gen.pollinations.ai/3d - trellis-2 first (image-conditioned,
+  //      best quality), hyper3d-rodin second (works from text alone).
+  //   3. Save the returned GLB bytes to disk and hand back a /files/ URL,
+  //      exactly like /generate-image and /generate-video do.
+  // THREE_D_API_URL/THREE_D_API_KEY (a custom provider) is tried FIRST if
+  // configured, so this is still a pluggable seam - Pollinations is just
+  // the built-in default now instead of a permanent "not_configured" stub.
   app.post('/generate-3d-model', async (req, res) => {
-    const { prompt } = req.body;
+    const { prompt, referenceImageUrl, resolution } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
 
-    if (!THREE_D_API_URL) {
-      return res.json({
-        success: false,
-        reason: 'not_configured',
-        message: "3D generation isn't connected on this backend yet - Nova will use its built-in template library instead."
-      });
+    // Optional custom provider, tried first if the operator configured one.
+    if (THREE_D_API_URL) {
+      try {
+        const response = await fetch(THREE_D_API_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(THREE_D_API_KEY ? { Authorization: `Bearer ${THREE_D_API_KEY}` } : {})
+          },
+          body: JSON.stringify({ prompt })
+        });
+        const data = await response.json();
+        if (response.ok && data?.modelUrl) {
+          return res.json({ success: true, modelUrl: data.modelUrl, format: data.format || 'glb', provider: 'custom' });
+        }
+        console.error('[generate-3d-model] Custom provider did not return a modelUrl, falling back to Pollinations.');
+      } catch (err) {
+        console.error('[generate-3d-model] Custom provider unreachable, falling back to Pollinations:', err.message);
+      }
     }
 
     try {
-      const response = await fetch(THREE_D_API_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(THREE_D_API_KEY ? { Authorization: `Bearer ${THREE_D_API_KEY}` } : {})
-        },
-        body: JSON.stringify({ prompt })
-      });
-      const data = await response.json();
-      if (!response.ok || !data?.modelUrl) {
-        return res.json({ success: false, reason: 'provider_error', message: 'The 3D generation provider could not produce a model for that prompt.' });
+      // Need a real reference image for trellis-2's best quality path.
+      // Reuse one if the app already generated it for this chat turn
+      // (Draw/Chat asset chain); otherwise make one now.
+      let imageUrl = referenceImageUrl || null;
+      if (!imageUrl) {
+        const imgBuffer = await tryPollinations(`${prompt}, single object, isolated on plain background, product photo, studio lighting`);
+        if (imgBuffer) {
+          const refId = uuid();
+          const refPath = path.join(UPLOAD_DIR, `${refId}.png`);
+          fs.writeFileSync(refPath, imgBuffer);
+          // Pollinations' /3d endpoint needs a URL it can fetch itself, so
+          // the reference image must be reachable from the public internet -
+          // this backend's own /files/ static route (already used for every
+          // other generated asset) serves that purpose.
+          imageUrl = `${req.protocol}://${req.get('host')}/files/${refId}.png`;
+        }
       }
-      res.json({ success: true, modelUrl: data.modelUrl, format: data.format || 'glb' });
+
+      const { buffer, model } = await generate3DModel(prompt, imageUrl, {
+        apiKey: POLLINATIONS_API_KEY,
+        resolution: resolution || 'low'
+      });
+
+      const fileId = uuid();
+      const filePath = path.join(UPLOAD_DIR, `${fileId}.glb`);
+      fs.writeFileSync(filePath, buffer);
+
+      res.json({
+        success: true,
+        modelUrl: `/files/${fileId}.glb`,
+        format: 'glb',
+        provider: 'pollinations',
+        model,
+        referenceImageUrl: imageUrl,
+        sizeBytes: buffer.length
+      });
     } catch (err) {
-      res.json({ success: false, reason: 'provider_unreachable', message: `3D generation provider error: ${err.message}` });
+      console.error('[generate-3d-model] Pollinations 3D failed:', err.message);
+      res.status(502).json({
+        success: false,
+        reason: 'provider_error',
+        message: `Nova couldn't generate a 3D model right now (${err.message}). Please try again.`
+      });
     }
   });
 
