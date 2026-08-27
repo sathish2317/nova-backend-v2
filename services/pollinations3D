@@ -1,0 +1,80 @@
+/**
+ * Pollinations 3D generation - real image-to-GLB pipeline.
+ * ------------------------------------------------------------------
+ * gen.pollinations.ai/3d/{prompt} is IMAGE-CONDITIONED for trellis-2
+ * (the default, best-quality model) - it needs a reference image, a
+ * text prompt alone is not enough. So the flow here is:
+ *
+ *   text prompt
+ *     -> (if no reference image given) generate one with the existing
+ *        Pollinations image endpoint
+ *     -> POST/GET gen.pollinations.ai/3d/{prompt}?model=trellis-2&image=<url>
+ *     -> real GLB bytes back
+ *
+ * hyper3d-rodin is the other available model and CAN take a text
+ * prompt directly (no image needed), so it's used as a fallback if
+ * trellis-2 fails - still a real model, never a fake/local mesh.
+ *
+ * No API key is required to call gen.pollinations.ai (anonymous tier
+ * works, just rate-limited); POLLINATIONS_API_KEY raises the limit if set.
+ * ------------------------------------------------------------------
+ */
+
+const GEN_BASE = 'https://gen.pollinations.ai';
+
+async function fetchGLB(url, apiKey, timeoutMs = 120000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`Pollinations 3D responded ${response.status}: ${text.slice(0, 200)}`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    // A real GLB always starts with the magic bytes "glTF" (0x676C5446).
+    if (buffer.length < 200 || buffer.toString('ascii', 0, 4) !== 'glTF') {
+      throw new Error('Pollinations 3D did not return a valid GLB (too small or missing glTF header).');
+    }
+    return buffer;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * @param {string} prompt - text description of the object
+ * @param {string|null} referenceImageUrl - a public image URL to condition on (required for trellis-2)
+ * @param {object} opts - { apiKey, resolution }
+ * @returns {Promise<{buffer: Buffer, model: string}>}
+ */
+async function generate3DModel(prompt, referenceImageUrl, opts = {}) {
+  const { apiKey, resolution = 'low' } = opts;
+
+  // 1. Preferred: trellis-2, image-conditioned, highest quality.
+  if (referenceImageUrl) {
+    try {
+      const url = `${GEN_BASE}/3d/${encodeURIComponent(prompt)}?model=trellis-2&resolution=${encodeURIComponent(resolution)}&image=${encodeURIComponent(referenceImageUrl)}`;
+      const buffer = await fetchGLB(url, apiKey);
+      return { buffer, model: 'trellis-2' };
+    } catch (err) {
+      console.error('[pollinations3D] trellis-2 failed:', err.message);
+    }
+  }
+
+  // 2. Fallback: hyper3d-rodin, can take a bare text prompt.
+  try {
+    const url = `${GEN_BASE}/3d/${encodeURIComponent(prompt)}?model=hyper3d-rodin`;
+    const buffer = await fetchGLB(url, apiKey);
+    return { buffer, model: 'hyper3d-rodin' };
+  } catch (err) {
+    console.error('[pollinations3D] hyper3d-rodin failed:', err.message);
+    throw new Error(`3D generation failed on every available model: ${err.message}`);
+  }
+}
+
+module.exports = { generate3DModel };
