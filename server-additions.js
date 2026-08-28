@@ -32,6 +32,7 @@ const PDFDocument = require('pdfkit');
 // whatever voices are already installed on the device.
 const { EdgeTTS } = require('node-edge-tts');
 const { generate3DModel } = require('./services/pollinations3D');
+const tripo = require('./services/tripoService');
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const PROJECT_DIR = path.join(__dirname, 'projects');
@@ -61,7 +62,7 @@ const CODE_EXT = [
   '.json', '.xml', '.yml', '.yaml', '.sql', '.md'
 ];
 
-module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY, THREE_D_API_URL, THREE_D_API_KEY, POLLINATIONS_API_KEY }) {
+module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_KEY, HF_API_KEY, THREE_D_API_URL, THREE_D_API_KEY, POLLINATIONS_API_KEY, TRIPO_API_KEY }) {
 
   app.post('/upload', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file received.' });
@@ -289,6 +290,76 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
         reason: 'provider_error',
         message: `Nova couldn't generate a 3D model right now (${err.message}). Please try again.`
       });
+    }
+  });
+
+  // ---------------- Tripo Developer API v3 (Nova AI Studio) ----------------
+  // Every route below just kicks off an async Tripo task and returns its
+  // task_id immediately - it never blocks the Node process waiting for the
+  // job to finish. The app polls GET /api/tripo/tasks/:taskId itself
+  // (see Nova3DViewer/generation progress UI).
+  const requireTripo = (req, res) => {
+    if (!TRIPO_API_KEY) {
+      res.status(503).json({
+        success: false,
+        reason: 'not_configured',
+        message: "Tripo isn't set up on this backend yet - add TRIPO_API_KEY to .env to enable AI Studio's advanced 3D tools."
+      });
+      return false;
+    }
+    return true;
+  };
+
+  // Human-readable messages for Tripo's documented error cases, so the
+  // app never has to show a raw API error to the user.
+  const tripoErrorMessage = (err) => {
+    if (err.status === 401) return 'Tripo API key is invalid or expired.';
+    if (err.status === 402 || /insufficient credit/i.test(err.message)) return "Nova doesn't have enough Tripo credits for this right now.";
+    if (err.status === 429) return 'Tripo is rate-limiting Nova right now - please try again in a moment.';
+    if (err.status === 404) return "That task/model couldn't be found - its link may have expired.";
+    return `Tripo couldn't complete this: ${err.message}`;
+  };
+
+  const tripoRoute = (fn) => async (req, res) => {
+    if (!requireTripo(req, res)) return;
+    try {
+      const data = await fn(req.body || {});
+      res.json({ success: true, ...data });
+    } catch (err) {
+      console.error('[tripo] request failed:', err.message);
+      res.status(err.status && err.status < 500 ? err.status : 502).json({ success: false, message: tripoErrorMessage(err) });
+    }
+  };
+
+  app.post('/api/tripo/generation/text-to-model', tripoRoute((b) => tripo.textToModel(TRIPO_API_KEY, b)));
+  app.post('/api/tripo/generation/image-to-model', tripoRoute((b) => tripo.imageToModel(TRIPO_API_KEY, b)));
+  app.post('/api/tripo/generation/multiview-to-model', tripoRoute((b) => tripo.multiviewToModel(TRIPO_API_KEY, b)));
+  app.post('/api/tripo/generation/image-to-multiview', tripoRoute((b) => tripo.imageToMultiview(TRIPO_API_KEY, b)));
+  app.post('/api/tripo/models/convert', tripoRoute((b) => tripo.convertModel(TRIPO_API_KEY, b)));
+  app.post('/api/tripo/mesh/segment', tripoRoute((b) => tripo.segmentMesh(TRIPO_API_KEY, b)));
+  app.post('/api/tripo/animations/rig-check', tripoRoute((b) => tripo.rigCheck(TRIPO_API_KEY, b)));
+  app.post('/api/tripo/animations/rig', tripoRoute((b) => tripo.rigModel(TRIPO_API_KEY, b)));
+  app.post('/api/tripo/animations/retarget', tripoRoute((b) => tripo.retargetAnimations(TRIPO_API_KEY, b)));
+
+  app.get('/api/tripo/tasks/:taskId', async (req, res) => {
+    if (!requireTripo(req, res)) return;
+    try {
+      const task = await tripo.getTask(TRIPO_API_KEY, req.params.taskId);
+      res.json({ success: true, task });
+    } catch (err) {
+      console.error('[tripo] task lookup failed:', err.message);
+      res.status(err.status && err.status < 500 ? err.status : 502).json({ success: false, message: tripoErrorMessage(err) });
+    }
+  });
+
+  app.get('/api/tripo/account/balance', async (req, res) => {
+    if (!requireTripo(req, res)) return;
+    try {
+      const balance = await tripo.getBalance(TRIPO_API_KEY);
+      res.json({ success: true, ...balance });
+    } catch (err) {
+      console.error('[tripo] balance lookup failed:', err.message);
+      res.status(err.status && err.status < 500 ? err.status : 502).json({ success: false, message: tripoErrorMessage(err) });
     }
   });
 
