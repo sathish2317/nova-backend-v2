@@ -341,6 +341,53 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
   app.post('/api/tripo/animations/rig', tripoRoute((b) => tripo.rigModel(TRIPO_API_KEY, b)));
   app.post('/api/tripo/animations/retarget', tripoRoute((b) => tripo.retargetAnimations(TRIPO_API_KEY, b)));
 
+  // ---------------- Convenience: generate + wait + cache locally ----------------
+  // What the Hologram/3D Viewer tab's "Generate" button actually calls.
+  // Tripo's own model_url expires in ~2 hours, so this downloads the GLB
+  // immediately and re-hosts it at /files/ the same way Pollinations 3D
+  // generation already does - the app never has to juggle an expiring URL.
+  // This DOES hold the HTTP request open while polling (Tripo jobs run
+  // 10-120s) - it does NOT block Node's event loop (await, not a sleep
+  // loop), but if your host enforces a hard request timeout shorter than
+  // that, raise it (see the Render note below) or switch this route to
+  // return task_id immediately and have the app poll /api/tripo/tasks/:id
+  // itself instead.
+  app.post('/api/tripo/generate-3d', async (req, res) => {
+    if (!requireTripo(req, res)) return;
+    const { prompt, imageUrl, model } = req.body;
+    if (!prompt && !imageUrl) return res.status(400).json({ success: false, message: 'prompt or imageUrl is required.' });
+
+    try {
+      const created = imageUrl
+        ? await tripo.imageToModel(TRIPO_API_KEY, { input: imageUrl, model })
+        : await tripo.textToModel(TRIPO_API_KEY, { prompt, model });
+
+      const task = await tripo.pollTask(TRIPO_API_KEY, created.task_id, { intervalMs: 2500, timeoutMs: 170000 });
+      const remoteUrl = task.output?.model_url || task.output?.pbr_model_url;
+      if (!remoteUrl) throw new Error('Tripo task succeeded but returned no model URL.');
+
+      const modelResponse = await fetch(remoteUrl);
+      if (!modelResponse.ok) throw new Error(`Couldn't download the finished model (HTTP ${modelResponse.status}).`);
+      const buffer = Buffer.from(await modelResponse.arrayBuffer());
+
+      const fileId = uuid();
+      fs.writeFileSync(path.join(UPLOAD_DIR, `${fileId}.glb`), buffer);
+
+      res.json({
+        success: true,
+        modelUrl: `/files/${fileId}.glb`,
+        format: 'glb',
+        provider: 'tripo',
+        taskId: created.task_id,
+        creditsConsumed: task.credits_consumed,
+        sizeBytes: buffer.length
+      });
+    } catch (err) {
+      console.error('[tripo] generate-3d failed:', err.message);
+      res.status(err.status && err.status < 500 ? err.status : 502).json({ success: false, message: tripoErrorMessage(err) });
+    }
+  });
+
   app.get('/api/tripo/tasks/:taskId', async (req, res) => {
     if (!requireTripo(req, res)) return;
     try {
