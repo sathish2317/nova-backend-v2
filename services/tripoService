@@ -1,0 +1,214 @@
+/**
+ * Tripo Developer API v3 - real, verified endpoints only.
+ * ------------------------------------------------------------------
+ * Base URL: https://openapi.tripo3d.ai/v3 (confirmed live, Aug 2026).
+ * V2 (api.tripo3d.ai/v2/openapi/task) retires Nov 1 2026 - not used here.
+ *
+ * Every generation/processing endpoint below is async: POST returns a
+ * task_id, then GET /tasks/{task_id} is polled until status is
+ * "success" | "failed" | "cancelled". Model URLs in the response expire
+ * after 5 minutes, so callers must download/re-host immediately.
+ *
+ * Endpoints implemented (each confirmed against a live doc page):
+ *   POST /generation/text-to-model
+ *   POST /generation/image-to-model      (inferred to use the same
+ *                                          unified "input" field every
+ *                                          other v3 endpoint below uses -
+ *                                          verify against the live docs
+ *                                          page before heavy production
+ *                                          use; flagged clearly below)
+ *   POST /generation/multiview-to-model  (same inference as above)
+ *   POST /generation/image-to-multiview
+ *   POST /models/convert
+ *   POST /mesh/segment
+ *   POST /animations/rig-check
+ *   POST /animations/rig
+ *   POST /animations/retarget            (shape inferred from the
+ *                                          Quick Start guide's worked
+ *                                          example - verify before
+ *                                          production use)
+ *   GET  /tasks/{task_id}
+ *   GET  /account/balance
+ *
+ * NOT implemented yet (real endpoints exist per the docs sidebar, but
+ * weren't individually verified this pass - texture, refine/mesh-complete,
+ * retopology, text-to-image, image-to-image, edit-multiview, import-model,
+ * batch task query, file upload/STS): add these the same way, one at a
+ * time, confirming the exact param names against developers.tripo3d.ai
+ * before wiring them in. Guessing an endpoint shape here would silently
+ * waste the user's credits on 400s.
+ * ------------------------------------------------------------------
+ */
+
+const BASE_URL = 'https://openapi.tripo3d.ai/v3';
+
+function authHeaders(apiKey) {
+  return { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+}
+
+async function tripoRequest(apiKey, method, path, body) {
+  const response = await fetch(`${BASE_URL}${path}`, {
+    method,
+    headers: authHeaders(apiKey),
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok || !data || data.code !== 0) {
+    const message = data?.message || data?.error?.message || `Tripo API responded ${response.status}`;
+    const err = new Error(message);
+    err.status = response.status;
+    err.tripoCode = data?.code;
+    throw err;
+  }
+  return data.data;
+}
+
+// ---------------- Generation ----------------
+
+/** Text -> 3D model. Returns { task_id }. */
+function textToModel(apiKey, { prompt, model = 'v3.1-20260211', texture = true, pbr = true, faceLimit, negativePrompt }) {
+  return tripoRequest(apiKey, 'POST', '/generation/text-to-model', {
+    prompt,
+    model,
+    texture,
+    pbr,
+    ...(faceLimit ? { face_limit: faceLimit } : {}),
+    ...(negativePrompt ? { negative_prompt: negativePrompt } : {})
+  });
+}
+
+/**
+ * Single image -> 3D model.
+ * `imageInput` is a public URL (or a Tripo file_token/task_id, if you
+ * have one already) - same unified "input" pattern used by every other
+ * v3 endpoint here. Verify this against developers.tripo3d.ai's
+ * "Image to 3D Model" page before relying on it for production traffic.
+ */
+function imageToModel(apiKey, { input, model = 'v3.1-20260211', texture = true, pbr = true, faceLimit }) {
+  return tripoRequest(apiKey, 'POST', '/generation/image-to-model', {
+    input,
+    model,
+    texture,
+    pbr,
+    ...(faceLimit ? { face_limit: faceLimit } : {})
+  });
+}
+
+/**
+ * Multi-view (front/left/back/right) images -> 3D model. `views` is an
+ * array of up to 4 URLs, front required, others may be omitted.
+ * Shape inferred from the same unified pattern - verify before production use.
+ */
+function multiviewToModel(apiKey, { views, model = 'v3.1-20260211', texture = true }) {
+  return tripoRequest(apiKey, 'POST', '/generation/multiview-to-model', {
+    input: views,
+    model,
+    texture
+  });
+}
+
+/** Single image -> 4 turnaround view images (front/left/back/right URLs). */
+function imageToMultiview(apiKey, { input }) {
+  return tripoRequest(apiKey, 'POST', '/generation/image-to-multiview', { input });
+}
+
+// ---------------- Model processing ----------------
+
+/** Convert a generated/uploaded model to another format (GLTF/FBX/USDZ/OBJ/STL). */
+function convertModel(apiKey, { input, format, textureSize, textureFormat, bake, fbxPreset, pivotToCenterBottom }) {
+  return tripoRequest(apiKey, 'POST', '/models/convert', {
+    input,
+    format,
+    ...(textureSize ? { texture_size: textureSize } : {}),
+    ...(textureFormat ? { texture_format: textureFormat } : {}),
+    ...(bake !== undefined ? { bake } : {}),
+    ...(fbxPreset ? { fbx_preset: fbxPreset } : {}),
+    ...(pivotToCenterBottom !== undefined ? { pivot_to_center_bottom: pivotToCenterBottom } : {})
+  });
+}
+
+/** Split a model into semantic/geometric parts. */
+function segmentMesh(apiKey, { input, model, segmentationGranularity, splitByConnectivity, refImage }) {
+  return tripoRequest(apiKey, 'POST', '/mesh/segment', {
+    input,
+    ...(model ? { model } : {}),
+    ...(segmentationGranularity ? { segmentation_granularity: segmentationGranularity } : {}),
+    ...(splitByConnectivity !== undefined ? { split_by_connectivity: splitByConnectivity } : {}),
+    ...(refImage ? { ref_image: refImage } : {})
+  });
+}
+
+// ---------------- Animation pipeline ----------------
+
+/** Check whether a model is riggable and get the recommended rig_type. Always call before rig(). */
+function rigCheck(apiKey, { input }) {
+  return tripoRequest(apiKey, 'POST', '/animations/rig-check', { input });
+}
+
+/** Add a skeleton rig. spec: 'tripo' | 'mixamo'. */
+function rigModel(apiKey, { input, model, rigType = 'biped', spec = 'mixamo', outFormat = 'glb' }) {
+  return tripoRequest(apiKey, 'POST', '/animations/rig', {
+    input,
+    ...(model ? { model } : {}),
+    rig_type: rigType,
+    spec,
+    out_format: outFormat
+  });
+}
+
+/**
+ * Apply preset animations (e.g. 'preset:idle', 'preset:walk', 'preset:run')
+ * to an already-rigged model's task_id. Shape follows the Quick Start
+ * guide's worked example - verify param names before production use.
+ */
+function retargetAnimations(apiKey, { input, animations }) {
+  return tripoRequest(apiKey, 'POST', '/animations/retarget', { input, animations });
+}
+
+// ---------------- Task + account ----------------
+
+function getTask(apiKey, taskId) {
+  return tripoRequest(apiKey, 'GET', `/tasks/${taskId}`);
+}
+
+function getBalance(apiKey) {
+  return tripoRequest(apiKey, 'GET', '/account/balance');
+}
+
+/**
+ * Polls a task until it finishes. Never call this inside an Express
+ * request handler for more than a few seconds - the route wrapper below
+ * returns the task_id immediately instead and lets the client poll
+ * /api/tripo/tasks/:taskId itself, so the Node process is never blocked
+ * waiting on a 10-120s Tripo job.
+ */
+async function pollTask(apiKey, taskId, { intervalMs = 2000, timeoutMs = 180000 } = {}) {
+  const startedAt = Date.now();
+  for (;;) {
+    const task = await getTask(apiKey, taskId);
+    if (task.status === 'success') return task;
+    if (task.status === 'failed' || task.status === 'cancelled') {
+      const err = new Error(`Tripo task ${task.status}: ${task.error || 'no reason given'}`);
+      err.task = task;
+      throw err;
+    }
+    if (Date.now() - startedAt > timeoutMs) throw new Error('Tripo task timed out client-side (job may still be running - check task_id later).');
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
+module.exports = {
+  textToModel,
+  imageToModel,
+  multiviewToModel,
+  imageToMultiview,
+  convertModel,
+  segmentMesh,
+  rigCheck,
+  rigModel,
+  retargetAnimations,
+  getTask,
+  getBalance,
+  pollTask
+};
