@@ -444,14 +444,32 @@ function decodeRssTitle(raw) {
   let t = raw.trim();
   const cdata = t.match(/^<!\[CDATA\[([\s\S]*?)\]\]>$/);
   if (cdata) t = cdata[1];
-  return t
+  t = t
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#0?39;/g, "'")
     .replace(/&apos;/g, "'")
-    .trim();
+    // Catch-all for any other numeric entity (&#8217; &#x2019; etc.) that
+    // slipped through - this is what was still showing as raw symbols
+    // even after the fixes above, since those only covered a few named
+    // entities and missed numeric ones entirely.
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
+  return t.trim();
+}
+
+// Best-effort, keyword-based tag for whether a headline leans toward a
+// risk/concern or a positive development - not a real classifier, just a
+// quick visual cue since AI news genuinely comes in both flavors and the
+// user wants to see both, not just one.
+const AI_RISK_WORDS = /\b(warn(?:s|ing)?|risk|danger(?:ous)?|threat|job loss(?:es)?|layoffs?|scam|fraud|deepfake|misinformation|disinformation|bias(?:ed)?|lawsuit|sues?|sued|ban(?:s|ned)?|regulat(?:e|ion|ors?)|crackdown|hallucinat\w*|cyberattack|surveillance|privacy concern|copyright|fake|harm(?:ful)?|backlash|controvers(?:y|ial)|shut ?down|security flaw|vulnerab\w*|exploit(?:ed)?)\b/i;
+const AI_POSITIVE_WORDS = /\b(breakthrough|advance(?:s|ment)?|boosts?|improves?|unveils?|launche?s?|discovers?|cures?|efficienc\w*|accelerat\w*|innovat\w*|partnership|funding|invests?|growth|milestone|record|success(?:ful)?|helps?|benefit\w*|life-?sav\w*)\b/i;
+function tagAiHeadline(title) {
+  if (AI_RISK_WORDS.test(title)) return `\u26A0\uFE0F ${title}`;
+  if (AI_POSITIVE_WORDS.test(title)) return `\u2705 ${title}`;
+  return title;
 }
 
 app.get('/news', async (req, res) => {
@@ -467,7 +485,10 @@ app.get('/news', async (req, res) => {
       // (e.g. "artificial intelligence - Google News") - drop that, not a
       // real headline.
       .filter((t) => t && !/google news$/i.test(t))
-      .slice(0, 5);
+      // Was 5 - now pulls more so both risk and positive AI stories from
+      // today actually show up rather than whatever 5 happened to be first.
+      .slice(0, 15)
+      .map(tagAiHeadline);
 
     if (titles.length === 0) return res.status(502).json({ error: 'No headlines found.' });
 
