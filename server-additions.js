@@ -710,45 +710,46 @@ Write complete, well-organized, ready-to-use content - not a description of what
   // ---------------- Camera "take a picture and search" ----------------
   // The app has called this route for a while (config.js -> ENDPOINTS.visionSearch)
   // but it never actually existed on the backend, so every camera-search
-  // request 404'd. Uses Gemini's vision model (gemini-3.7-flash, Google's
-  // current GA workhorse multimodal model) to identify + describe the
-  // photo, then narrates the result in Tamil as well (subjectTamil /
-  // descriptionTamil) since that's what the app speaks aloud.
+  // request 404'd.
+  //
+  // Identification uses Groq's own vision model (qwen/qwen3.8-27b) - same
+  // GROQ_API_KEY the rest of chat already uses, so this no longer needs
+  // GEMINI_API_KEY at all. If GEMINI_API_KEY IS set, a second step below
+  // still uses Gemini's Google Search grounding to enrich the description
+  // with current facts - that part stays optional/best-effort.
   app.post('/vision-search', async (req, res) => {
     const { fileId } = req.body;
     const file = fileIndex.get(fileId);
     if (!file) return res.status(404).json({ error: 'Unknown fileId - upload the photo first.' });
-    if (!GEMINI_API_KEY) {
-      return res.status(501).json({ error: 'Photo search needs GEMINI_API_KEY configured on the backend - Gemini is the only free vision model wired up here.' });
-    }
     try {
       const imageBuffer = fs.readFileSync(file.path);
       const base64Image = imageBuffer.toString('base64');
       const mimeType = file.mimeType && file.mimeType.startsWith('image/') ? file.mimeType : 'image/jpeg';
 
-      const visionRes = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent?key=${GEMINI_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{
-              parts: [
-                {
-                  text: 'Identify the main subject of this photo and give a short, factual, helpful description of it - as if researching it for someone who just took the picture. Respond ONLY with JSON (no markdown fences): {"subject": "short name of what it is", "description": "2-4 sentence factual description or interesting facts about it"}'
-                },
-                { inlineData: { mimeType, data: base64Image } }
-              ]
-            }]
-          })
-        }
-      );
+      const visionRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${GROQ_API_KEY}` },
+        body: JSON.stringify({
+          model: 'qwen/qwen3.8-27b',
+          messages: [{
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: 'Identify the main subject of this photo and give a short, factual, helpful description of it - as if researching it for someone who just took the picture. Respond ONLY with JSON (no markdown fences): {"subject": "short name of what it is", "description": "2-4 sentence factual description or interesting facts about it"}'
+              },
+              { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Image}` } }
+            ]
+          }],
+          response_format: { type: 'json_object' }
+        })
+      });
       if (!visionRes.ok) {
         const errText = await visionRes.text();
-        throw new Error(`Gemini vision responded ${visionRes.status}: ${errText.slice(0, 200)}`);
+        throw new Error(`Groq vision responded ${visionRes.status}: ${errText.slice(0, 200)}`);
       }
       const visionData = await visionRes.json();
-      const rawText = visionData?.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text || '{}';
+      const rawText = visionData?.choices?.[0]?.message?.content || '{}';
       const clean = rawText.replace(/```json|```/g, '').trim();
       let parsed;
       try { parsed = JSON.parse(clean); } catch (e) { parsed = { subject: 'Unknown subject', description: clean.slice(0, 400) || 'Could not analyze this photo.' }; }
@@ -768,35 +769,39 @@ Write complete, well-organized, ready-to-use content - not a description of what
       // the whole request.
       let description = briefDescription;
       let sources = [];
-      try {
-        const groundedRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent?key=${GEMINI_API_KEY}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{
-                parts: [{
-                  text: `Using Google Search, find current, accurate, detailed information about "${subject}" (this was identified from a photo someone just took). Write a thorough but easy-to-follow 4-6 sentence explanation: what it is, key facts, and anything notable or currently relevant. Write it directly for the person who took the photo, not as a search-result summary.`
-                }]
-              }],
-              tools: [{ google_search: {} }]
-            })
+      // Optional enrichment step - only attempted when GEMINI_API_KEY is
+      // actually configured, since it's a bonus, not a requirement.
+      if (GEMINI_API_KEY) {
+        try {
+          const groundedRes = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent?key=${GEMINI_API_KEY}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                contents: [{
+                  parts: [{
+                    text: `Using Google Search, find current, accurate, detailed information about "${subject}" (this was identified from a photo someone just took). Write a thorough but easy-to-follow 4-6 sentence explanation: what it is, key facts, and anything notable or currently relevant. Write it directly for the person who took the photo, not as a search-result summary.`
+                  }]
+                }],
+                tools: [{ google_search: {} }]
+              })
+            }
+          );
+          if (groundedRes.ok) {
+            const groundedData = await groundedRes.json();
+            const groundedText = groundedData?.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text;
+            if (groundedText) description = groundedText.trim();
+            const chunks = groundedData?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+            sources = chunks
+              .map((c) => ({ title: c.web?.title, url: c.web?.uri }))
+              .filter((s) => s.url)
+              .slice(0, 5);
           }
-        );
-        if (groundedRes.ok) {
-          const groundedData = await groundedRes.json();
-          const groundedText = groundedData?.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text;
-          if (groundedText) description = groundedText.trim();
-          const chunks = groundedData?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-          sources = chunks
-            .map((c) => ({ title: c.web?.title, url: c.web?.uri }))
-            .filter((s) => s.url)
-            .slice(0, 5);
+        } catch (e) {
+          // Grounded search failed - `description` already holds the
+          // fallback from the vision call, so the request still succeeds.
         }
-      } catch (e) {
-        // Grounded search failed - `description` already holds the
-        // fallback from the vision call, so the request still succeeds.
       }
 
       // Best-effort Tamil narration - if translation fails for any reason,
