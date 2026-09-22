@@ -107,7 +107,10 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
       const timer = setTimeout(() => controller.abort(), 45000);
       try {
         const seed = Math.floor(Math.random() * 1000000000);
-        const url = `${POLLINATIONS_BASE}/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&model=${models[attempt]}&seed=${seed}`;
+        // enhance=true asks Pollinations' own model to expand/improve the
+        // prompt before drawing - one of the few free levers that
+        // noticeably helps output quality/realism without a paid model.
+        const url = `${POLLINATIONS_BASE}/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&enhance=true&model=${models[attempt]}&seed=${seed}`;
         const response = await fetch(url, { signal: controller.signal });
         const type = response.headers.get('content-type') || '';
         if (!response.ok || !type.startsWith('image/')) {
@@ -143,6 +146,11 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
       prompt = await translateText(GROQ_API_KEY, prompt, 'English');
     }
     prompt = cleanImagePrompt(prompt);
+    // Free "make it look real" lever #2: bias the prompt itself toward a
+    // photograph unless it already asks for some other style (cartoon,
+    // logo, sketch, painting...) - flux/turbo lean cartoonish/illustrated
+    // on a bare, short prompt with no style cues at all.
+    prompt = addRealismBoost(prompt);
     console.log(`[generate-image] prompt: "${rawPrompt.slice(0, 80)}" -> "${prompt.slice(0, 80)}"`);
 
     // 1. Pollinations.ai first - completely free, no key, no quota.
@@ -1372,6 +1380,16 @@ function sampleSourceFiles(files, max, projectDir) {
 // Strips the command part off an image request so only the subject is
 // left: "generate an image of a cat on a bike" -> "a cat on a bike",
 // "draw a dog" -> "dog", "create a logo for my cafe" -> "logo for my cafe".
+// Words that mean the person ALREADY chose a non-photographic look -
+// forcing "photorealistic" onto "a cartoon cat" or "a logo for my cafe"
+// would fight the request instead of helping it.
+const NON_PHOTO_STYLE = /\b(cartoon|anime|manga|chibi|illustration|illustrated|drawing|sketch|painting|painted|watercolor|oil painting|pixel art|8-?bit|vector|line art|clip ?art|comic|comic book|logo|icon|emoji|sticker|silhouette|minimalist|flat design|doodle|caricature|low poly|origami|papercraft|stained glass|pop art|abstract|surreal|fantasy art|concept art|3d render|render|cgi|claymation|cyberpunk art|infographic)\b/i;
+
+function addRealismBoost(prompt) {
+  if (NON_PHOTO_STYLE.test(prompt)) return prompt;
+  return `${prompt}, photorealistic, realistic lighting and shadows, natural skin and material textures, shot on a DSLR camera, sharp focus, highly detailed, 8k`;
+}
+
 function cleanImagePrompt(text) {
   const t = String(text || '').replace(/\s+/g, ' ').trim();
   const withOf = t.match(/\b(?:images?|pictures?|photos?|pics?|artworks?|illustrations?|paintings?|drawings?|portraits?|wallpapers?|posters?)\s+(?:of|about|showing|featuring|with)\s+(.+)$/i);
