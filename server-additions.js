@@ -146,10 +146,16 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
       prompt = await translateText(GROQ_API_KEY, prompt, 'English');
     }
     prompt = cleanImagePrompt(prompt);
+    // Expand short/named-subject prompts ("obito and might guy fighting")
+    // into a full visual description an image model can actually follow -
+    // see enhancePromptForImage() above. This runs before the realism
+    // boost so the LLM's own style call (anime vs photoreal etc.) wins.
+    prompt = await enhancePromptForImage(GROQ_API_KEY, prompt);
     // Free "make it look real" lever #2: bias the prompt itself toward a
     // photograph unless it already asks for some other style (cartoon,
     // logo, sketch, painting...) - flux/turbo lean cartoonish/illustrated
-    // on a bare, short prompt with no style cues at all.
+    // on a bare, short prompt with no style cues at all. Skipped when the
+    // enhancement step above already picked a style.
     prompt = addRealismBoost(prompt);
     console.log(`[generate-image] prompt: "${rawPrompt.slice(0, 80)}" -> "${prompt.slice(0, 80)}"`);
 
@@ -1393,6 +1399,63 @@ const NON_PHOTO_STYLE = /\b(cartoon|anime|manga|chibi|illustration|illustrated|d
 function addRealismBoost(prompt) {
   if (NON_PHOTO_STYLE.test(prompt)) return prompt;
   return `${prompt}, photorealistic, realistic lighting and shadows, natural skin and material textures, shot on a DSLR camera, sharp focus, highly detailed, 8k`;
+}
+
+// ---------------------------------------------------------------------
+// Prompt enhancement (ChatGPT/DALL-E-style prompt rewriting)
+// ---------------------------------------------------------------------
+// This is the real fix for "I asked for X but got something else".
+// Pollinations' free models (flux/turbo) are small, community-run models -
+// they don't reliably know specific named characters, specific scenes, or
+// multi-subject composition from a short prompt the way DALL-E 3 (which
+// ChatGPT uses) or Nano Banana (Gemini) do, because those commercial
+// models rewrite/expand your prompt internally before drawing. Pollinations'
+// own "enhance=true" flag helps a little but is no substitute for that.
+//
+// So: before sending anything to Pollinations, ask Groq's text model
+// (already configured for chat/fun/etc. - no extra key needed) to expand
+// the prompt into a single, detailed, visually-descriptive prompt - who is
+// in the scene, what they look like, their pose/action, the setting, the
+// art style - the same way you'd describe it to a human artist who has
+// never heard of the characters by name. This is the single biggest lever
+// for "why does the output not match what I asked for" and works for any
+// subject, not just anime characters.
+async function enhancePromptForImage(groqApiKey, rawPrompt) {
+  if (!groqApiKey) return rawPrompt;
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${groqApiKey}` },
+      body: JSON.stringify({
+        model: 'openai/gpt-oss-120b',
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You expand short image-generation requests into a single, detailed, ' +
+              'purely visual prompt for a text-to-image model. Describe exactly what ' +
+              'should appear on screen: each subject\'s appearance (hair, clothing, ' +
+              'build, distinguishing features), their pose/action, the setting, ' +
+              'lighting, and art style (e.g. anime, comic, photoreal - infer the ' +
+              'right style from the subject; do not default to photorealistic for ' +
+              'stylized/animated characters). If a subject is a known character, ' +
+              'describe their visual appearance directly rather than only naming ' +
+              'them, since the image model cannot look names up. Output ONLY the ' +
+              'final prompt, one paragraph, no preamble, no quotes, under 80 words.'
+          },
+          { role: 'user', content: rawPrompt }
+        ],
+        temperature: 0.4
+      })
+    });
+    if (!response.ok) return rawPrompt;
+    const data = await response.json();
+    const expanded = data?.choices?.[0]?.message?.content?.trim();
+    return expanded && expanded.length >= 10 ? expanded : rawPrompt;
+  } catch (e) {
+    console.error('[generate-image] prompt enhancement failed, using raw prompt:', e.message);
+    return rawPrompt;
+  }
 }
 
 function cleanImagePrompt(text) {
