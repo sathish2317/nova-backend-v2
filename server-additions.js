@@ -94,30 +94,56 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
   // No key, no auth header - just a GET request that returns image bytes
   // directly. Returns null (never throws) so the caller can fall through
   // to HF/Gemini cleanly on any failure.
+  //
+  // Now tries up to 3 times (flux, flux with a fresh seed, then the faster
+  // "turbo" model), each with a 45s timeout. Before, ONE slow/failed
+  // request meant no image at all - which is why text requests only
+  // "sometimes" produced a picture: Pollinations is community-run and
+  // often needs a second attempt.
   async function tryPollinations(prompt) {
-    try {
-      const url = `${POLLINATIONS_BASE}/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&model=flux`;
-      const response = await fetch(url);
-      if (!response.ok) {
-        console.error(`[generate-image] Pollinations failed: HTTP ${response.status}`);
-        return null;
+    const models = ['flux', 'flux', 'turbo'];
+    for (let attempt = 0; attempt < models.length; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 45000);
+      try {
+        const seed = Math.floor(Math.random() * 1000000000);
+        const url = `${POLLINATIONS_BASE}/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&model=${models[attempt]}&seed=${seed}`;
+        const response = await fetch(url, { signal: controller.signal });
+        const type = response.headers.get('content-type') || '';
+        if (!response.ok || !type.startsWith('image/')) {
+          console.error(`[generate-image] Pollinations attempt ${attempt + 1} (${models[attempt]}) failed: HTTP ${response.status} ${type}`);
+        } else {
+          const buffer = Buffer.from(await response.arrayBuffer());
+          if (buffer.length >= 500) return buffer;
+          console.error(`[generate-image] Pollinations attempt ${attempt + 1} returned an unusably small response.`);
+        }
+      } catch (err) {
+        console.error(`[generate-image] Pollinations attempt ${attempt + 1} (${models[attempt]}) failed:`, err.message);
+      } finally {
+        clearTimeout(timer);
       }
-      const arrayBuffer = await response.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-      if (buffer.length < 500) {
-        console.error('[generate-image] Pollinations returned an unusably small response.');
-        return null;
-      }
-      return buffer;
-    } catch (err) {
-      console.error('[generate-image] Pollinations failed:', err.message);
-      return null;
+      await new Promise((r) => setTimeout(r, 1500));
     }
+    return null;
   }
 
   app.post('/generate-image', async (req, res) => {
-    const { prompt } = req.body;
-    if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
+    const rawPrompt = req.body && req.body.prompt;
+    if (!rawPrompt || typeof rawPrompt !== 'string' || !rawPrompt.trim()) {
+      return res.status(400).json({ error: 'prompt is required.' });
+    }
+
+    // The app sends exactly what you typed/said, e.g. "generate an image of
+    // a cat" or - when you speak Tamil - "ஒரு பூனை படம் உருவாக்கு". Image
+    // models draw much better from a short English description of the
+    // subject, so: Tamil -> English first, then drop the "generate an image
+    // of" command words so the model isn't asked to draw the words.
+    let prompt = rawPrompt.trim();
+    if (/[\u0B80-\u0BFF]/.test(prompt) && GROQ_API_KEY) {
+      prompt = await translateText(GROQ_API_KEY, prompt, 'English');
+    }
+    prompt = cleanImagePrompt(prompt);
+    console.log(`[generate-image] prompt: "${rawPrompt.slice(0, 80)}" -> "${prompt.slice(0, 80)}"`);
 
     // 1. Pollinations.ai first - completely free, no key, no quota.
     const pollinationsBuffer = await tryPollinations(prompt);
@@ -128,7 +154,7 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
       return res.json({
         imageUrl: `/files/${fileId}.png`,
         imageBase64: `data:image/png;base64,${pollinationsBuffer.toString('base64')}`,
-        caption: 'Here\'s what I generated (Pollinations).'
+        caption: 'Here\'s what I generated.', provider: 'pollinations'
       });
     }
 
@@ -150,7 +176,7 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
           return res.json({
             imageUrl: `/files/${fileId}.png`,
             imageBase64: `data:image/png;base64,${buffer.toString('base64')}`,
-            caption: 'Here\'s what I generated (Hugging Face).'
+            caption: 'Here\'s what I generated.', provider: 'huggingface'
           });
         }
         hfError = 'Hugging Face returned an unusably small/empty response.';
@@ -201,7 +227,7 @@ module.exports = function registerNovaLabRoutes(app, { GROQ_API_KEY, GEMINI_API_
       res.json({
         imageUrl: `/files/${fileId}.png`,
         imageBase64: `data:image/png;base64,${imagePart.inlineData.data}`,
-        caption: 'Here\'s what I generated (Gemini).'
+        caption: 'Here\'s what I generated.', provider: 'gemini'
       });
     } catch (err) {
       res.status(500).json({ error: `Image generation failed: ${err.message}` });
@@ -1341,6 +1367,19 @@ function sampleSourceFiles(files, max, projectDir) {
       return `--- ${f} ---\n${content}`;
     })
     .join('\n\n');
+}
+
+// Strips the command part off an image request so only the subject is
+// left: "generate an image of a cat on a bike" -> "a cat on a bike",
+// "draw a dog" -> "dog", "create a logo for my cafe" -> "logo for my cafe".
+function cleanImagePrompt(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  const withOf = t.match(/\b(?:images?|pictures?|photos?|pics?|artworks?|illustrations?|paintings?|drawings?|portraits?|wallpapers?|posters?)\s+(?:of|about|showing|featuring|with)\s+(.+)$/i);
+  if (withOf && withOf[1].trim().length >= 2) return withOf[1].trim();
+  const stripped = t
+    .replace(/^(?:hey\s+)?(?:nova[,\s]+)?(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?(?:generate|create|make|draw|design|paint|sketch|render|produce)\s+(?:me\s+)?(?:an?\s+|the\s+|some\s+)?/i, '')
+    .trim();
+  return stripped.length >= 2 ? stripped : t;
 }
 
 // Small, best-effort translator for Tamil narration on /vision-search.
