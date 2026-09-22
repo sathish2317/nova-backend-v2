@@ -1433,19 +1433,31 @@ async function enhancePromptForImage(groqApiKey, rawPrompt) {
             role: 'system',
             content:
               'You expand short image-generation requests into a single, detailed, ' +
-              'purely visual prompt for a text-to-image model. Describe exactly what ' +
-              'should appear on screen: each subject\'s appearance (hair, clothing, ' +
-              'build, distinguishing features), their pose/action, the setting, ' +
-              'lighting, and art style (e.g. anime, comic, photoreal - infer the ' +
-              'right style from the subject; do not default to photorealistic for ' +
-              'stylized/animated characters). If a subject is a known character, ' +
-              'describe their visual appearance directly rather than only naming ' +
-              'them, since the image model cannot look names up. Output ONLY the ' +
-              'final prompt, one paragraph, no preamble, no quotes, under 80 words.'
+              'purely visual prompt for a text-to-image model that follows literal ' +
+              'wording closely but has NO knowledge of names, characters, or ' +
+              'abstract verbs - only concrete visual description. Rules:\n' +
+              '1. Keep the EXACT number of subjects the user asked for - if they said ' +
+              'two people/characters, both must be explicitly described and both ' +
+              'must appear in the scene composition, not just one.\n' +
+              '2. Translate every action/verb into a concrete, drawable visual pose: ' +
+              '"fighting" -> specific combat stance, fists/weapons raised, mid-motion, ' +
+              'impact effects; "talking" -> facing each other, close distance, one with ' +
+              'mouth open mid-word and an open hand gesture, the other making eye ' +
+              'contact and listening; do this for any verb, never leave it abstract.\n' +
+              '3. If a subject is a known named character, describe their visual ' +
+              'appearance directly (hair, build, clothing, colors, distinguishing ' +
+              'features) instead of only naming them, since the image model cannot ' +
+              'look names up - and pick the art style that actually matches that ' +
+              'character/setting (e.g. anime for an anime character) rather than ' +
+              'defaulting to photorealistic.\n' +
+              '4. State the composition plainly: how many subjects, roughly where ' +
+              'each one is in frame, and that they are the clear focal point.\n' +
+              'Output ONLY the final prompt, one paragraph, no preamble, no quotes, ' +
+              'no more than 90 words.'
           },
           { role: 'user', content: rawPrompt }
         ],
-        temperature: 0.4
+        temperature: 0.35
       })
     });
     if (!response.ok) return rawPrompt;
