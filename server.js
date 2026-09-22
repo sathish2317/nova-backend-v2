@@ -9,6 +9,7 @@ const rateLimit = require('express-rate-limit');
 
 const app = express();
 const path = require('path');
+const fs = require('fs');
 const registerNovaLabRoutes = require('./server-additions');
 
 // Render sits behind a reverse proxy - this tells Express to trust the
@@ -29,6 +30,10 @@ const TRIPO_API_KEY = process.env.TRIPO_API_KEY;
 // Groq retired llama-3.3-70b-versatile on Aug 16, 2026. Using their
 // recommended replacement - same "everyday chat" tier, faster inference.
 const GROQ_MODEL = 'openai/gpt-oss-120b';
+// Groq's own vision-capable model, used only for chat messages that have a
+// photo attached - GROQ_MODEL above (gpt-oss-120b) is text-only. Same
+// GROQ_API_KEY, same OpenAI-compatible endpoint, no separate key needed.
+const GROQ_VISION_MODEL = 'qwen/qwen3.8-27b';
 
 if (!GROQ_API_KEY) {
   console.error('ERROR: GROQ_API_KEY is missing. Add it in your .env file (local) or Render environment variables (deployed).');
@@ -150,12 +155,91 @@ app.get('/', (req, res) => {
 });
 
 // Main chat endpoint - the mobile app calls this
+// Same uploads folder /upload and /files serve from (server-additions.js
+// keeps its own UPLOAD_DIR constant pointing at the same path - both
+// files live next to each other, so this stays in sync automatically).
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+
+// "Analyze this shirt and tell about it" etc. - a normal chat message that
+// also has a photo attached. Uses Groq's own vision model (qwen3.8-27b) -
+// same GROQ_API_KEY as normal chat, no Gemini key needed. gpt-oss-120b
+// (GROQ_MODEL, used below for text-only messages) can't see images at all.
+async function handleChatWithImage(req, res, message, history, attachment) {
+  try {
+    // The upload URL is always "/files/<fileId+ext>" (see /upload in
+    // server-additions.js) - the file itself lives right there in
+    // UPLOAD_DIR under that same name, so it's read directly off disk
+    // instead of the backend making an HTTP request to itself.
+    const fileName = path.basename(String(attachment.url || ''));
+    const filePath = path.join(UPLOAD_DIR, fileName);
+    if (!fileName || !fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'That photo is no longer available - try attaching it again.' });
+    }
+
+    const imageBuffer = fs.readFileSync(filePath);
+    const base64Image = imageBuffer.toString('base64');
+    const mimeType = attachment.mimeType && attachment.mimeType.startsWith('image/') ? attachment.mimeType : 'image/jpeg';
+
+    // Same OpenAI-style messages array the text-only path below builds,
+    // just with the final user turn's content as an array so the image can
+    // sit alongside the text (the vision-model shape Groq's API expects).
+    const messages = [{ role: 'system', content: getSystemPrompt(req.body.personality) }];
+    if (Array.isArray(history)) {
+      for (const turn of history) {
+        if (turn && turn.role && turn.text) {
+          messages.push({ role: turn.role === 'nova' ? 'assistant' : 'user', content: turn.text });
+        }
+      }
+    }
+    messages.push({
+      role: 'user',
+      content: [
+        { type: 'text', text: message },
+        { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Image}` } }
+      ]
+    });
+
+    const visionRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${GROQ_API_KEY}` },
+      body: JSON.stringify({ model: GROQ_VISION_MODEL, messages })
+    });
+    if (!visionRes.ok) {
+      const errText = await visionRes.text();
+      console.error('Groq vision chat error:', errText);
+      return res.status(502).json({ error: 'Nova could not look at that photo right now. Try again shortly.' });
+    }
+    const visionData = await visionRes.json();
+    const reply = visionData?.choices?.[0]?.message?.content;
+    if (!reply) return res.status(502).json({ error: 'Nova got an empty response looking at that photo.' });
+
+    res.json({ reply: reply.trim() });
+  } catch (err) {
+    console.error('Server error (chat with image):', err);
+    res.status(500).json({ error: 'Something went wrong looking at that photo.' });
+  }
+}
+
 app.post('/chat', chatLimiter, async (req, res) => {
   try {
-    const { message, history, personality } = req.body;
+    const { message, history, personality, attachments } = req.body;
 
     if (!message || typeof message !== 'string' || message.trim().length === 0) {
       return res.status(400).json({ error: 'Message is required.' });
+    }
+
+    // BUG FIX: attachments were already being sent here from the app
+    // (uploaded photo's fileId/url), but this route never read them - it
+    // only ever sent the typed text to Groq's text-only model, which then
+    // correctly but unhelpfully said "I'm not able to view images
+    // directly" every single time, even though the photo really had been
+    // uploaded. An attached image now goes to Gemini's vision model
+    // instead of Groq, with the photo actually attached.
+    const imageAttachment = Array.isArray(attachments)
+      ? attachments.find((a) => a && typeof a.mimeType === 'string' && a.mimeType.startsWith('image/'))
+      : null;
+    if (imageAttachment) {
+      return handleChatWithImage(req, res, message, history, imageAttachment);
     }
 
     // Answer time/date questions instantly with real server time,
@@ -343,17 +427,46 @@ app.get('/weather', async (req, res) => {
   }
 });
 
-// News endpoint - top world headlines from BBC's public RSS feed (free,
-// no API key needed).
+// News endpoint - was general world news (BBC), changed to AI-specific
+// news: how AI is improving day to day and its impact/progress across
+// countries, not general world events. Google News' public RSS search
+// (free, no API key) is used instead of a single outlet's feed, so
+// headlines are pulled from many different publishers and countries in
+// one request.
+//
+// BUG FIX: RSS titles come wrapped as <title><![CDATA[Some headline]]>
+// </title> - the old code only stripped the <title> tags, so the raw
+// "<![CDATA[...]]>" markers were sent straight to the app and shown
+// on screen exactly like that. decodeRssTitle() below strips the CDATA
+// wrapper and un-escapes the handful of HTML entities RSS feeds commonly
+// use (&amp; &quot; etc.), so headlines read as plain text.
+function decodeRssTitle(raw) {
+  let t = raw.trim();
+  const cdata = t.match(/^<!\[CDATA\[([\s\S]*?)\]\]>$/);
+  if (cdata) t = cdata[1];
+  return t
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .trim();
+}
+
 app.get('/news', async (req, res) => {
   try {
-    const response = await fetch('http://feeds.bbci.co.uk/news/world/rss.xml');
+    const feedUrl = 'https://news.google.com/rss/search?q=artificial+intelligence+when:2d&hl=en-US&gl=US&ceid=US:en';
+    const response = await fetch(feedUrl);
     if (!response.ok) return res.status(502).json({ error: 'News service unavailable right now.' });
 
     const xml = await response.text();
-    const titles = [...xml.matchAll(/<title>(.*?)<\/title>/g)]
-      .map((m) => m[1])
-      .filter((t) => t && !t.toLowerCase().includes('bbc news'))
+    const titles = [...xml.matchAll(/<title>([\s\S]*?)<\/title>/g)]
+      .map((m) => decodeRssTitle(m[1]))
+      // Google News RSS repeats the feed's own title as the first <title>
+      // (e.g. "artificial intelligence - Google News") - drop that, not a
+      // real headline.
+      .filter((t) => t && !/google news$/i.test(t))
       .slice(0, 5);
 
     if (titles.length === 0) return res.status(502).json({ error: 'No headlines found.' });
