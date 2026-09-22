@@ -472,6 +472,53 @@ function tagAiHeadline(title) {
   return title;
 }
 
+// AI model comparison - what the Fun tab's "AI news" was missing: the
+// Google News RSS feed above only returns generic headlines, never a
+// breakdown of what actually changed in ChatGPT/Claude/Gemini specifically.
+// This asks Groq's text model directly for a short, current-as-of-training
+// comparison, since there's no single feed for "what's new across the big
+// three assistants" the way there is for general news.
+app.get('/ai-comparison', async (req, res) => {
+  try {
+    const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a neutral AI-industry analyst. Compare ChatGPT (OpenAI), ' +
+              'Claude (Anthropic), and Gemini (Google) for a general reader. For ' +
+              'EACH of the three, give: (1) one line on its recent strengths/' +
+              'improvements, (2) one line on its main disadvantages/limitations. ' +
+              'Be balanced - don\'t favor one over the others. End with one short ' +
+              'line noting that all three ship new updates often, so specifics can ' +
+              'shift. Plain text, short labeled sections, no markdown asterisks.'
+          },
+          { role: 'user', content: 'Give me the comparison.' }
+        ],
+        temperature: 0.5
+      })
+    });
+
+    if (!groqResponse.ok) {
+      const errText = await groqResponse.text();
+      console.error('Groq API error (ai-comparison):', errText);
+      return res.status(502).json({ error: 'Could not put the comparison together right now.' });
+    }
+
+    const data = await groqResponse.json();
+    const reply = data?.choices?.[0]?.message?.content;
+    if (!reply) return res.status(502).json({ error: 'Empty response from Groq.' });
+    res.json({ reply });
+  } catch (err) {
+    console.error('Server error (ai-comparison):', err);
+    res.status(500).json({ error: 'Something went wrong building the AI comparison.' });
+  }
+});
+
 app.get('/news', async (req, res) => {
   try {
     const feedUrl = 'https://news.google.com/rss/search?q=artificial+intelligence+when:2d&hl=en-US&gl=US&ceid=US:en';
